@@ -1,0 +1,7 @@
+{
+  "pck_name": "Sts2Mcp",
+  "name": "STS2 MCP Probe",
+  "author": "local",
+  "description": "Minimal MCP probe: exports combat state and accepts play_card command.",
+  "version": "0.0.1"
+}

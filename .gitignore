@@ -1,0 +1,18 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/node_modules/
+**/dist/
+
+# IDE
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime outputs
+*.log
