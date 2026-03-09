@@ -34,11 +34,25 @@ public static class ProbeModEntry
     private static readonly TimeSpan DumpInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan DictionaryRetryInterval = TimeSpan.FromSeconds(2);
     private const int MaxHistoryEntries = 80;
+    private const int MaxBattleSegments = 120;
+    private const int MaxDashboardLogEntries = 30;
+    private const int RoutePlanDepth = 4;
     private static DateTime _lastDumpUtc = DateTime.MinValue;
     private static DateTime _lastCommandCheckUtc = DateTime.MinValue;
     private static DateTime _lastDictionaryAttemptUtc = DateTime.MinValue;
     private static bool _hooksInstalled;
     private static bool _dictionaryDumped;
+    private static bool _wasInCombat;
+    private static int _lastProcessedHistoryEntryCount;
+    private static readonly StatsAccumulator _totalStats = new();
+    private static readonly Dictionary<string, StatsAccumulator> _modeTotals = new(StringComparer.Ordinal)
+    {
+        ["singleplayer"] = new(),
+        ["multiplayer"] = new()
+    };
+    private static readonly List<BattleSegmentSnapshot> _battleSegments = new();
+    private static BattleSegmentRuntime? _activeBattle;
+    private static readonly Dictionary<string, string> _powerTypeCache = new(StringComparer.Ordinal);
 
     private static readonly string WorkDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -46,6 +60,8 @@ public static class ProbeModEntry
     private static readonly string StateFilePath = Path.Combine(WorkDir, "state.json");
     private static readonly string StatusFilePath = Path.Combine(WorkDir, "status.json");
     private static readonly string DictionaryFilePath = Path.Combine(WorkDir, "dictionary.json");
+    private static readonly string AnalyticsFilePath = Path.Combine(WorkDir, "analytics.json");
+    private static readonly string DashboardFilePath = Path.Combine(WorkDir, "dashboard.json");
     private static readonly string CommandFilePath = Path.Combine(WorkDir, "command.json");
     private static readonly string ProbeLogPath = Path.Combine(WorkDir, "probe.log");
 
@@ -370,7 +386,11 @@ public static class ProbeModEntry
             List<PlayerSnapshot> allPlayers = state.Players.Select(BuildPlayerSnapshot).ToList();
             RunContextSnapshot runContext = BuildRunContextSnapshot(state, localPlayerEntity);
             ActionSpaceSnapshot actionSpace = BuildActionSpaceSnapshot(state, localPlayerEntity);
-            CombatHistorySnapshot combatHistory = BuildCombatHistorySnapshot(state);
+            List<CombatHistoryEntry> historyEntries = GetCombatHistoryEntries();
+            CombatHistorySnapshot combatHistory = BuildCombatHistorySnapshot(state, historyEntries);
+            AnalyticsSnapshot analytics = UpdateAnalytics(state, localPlayerEntity, historyEntries, combatHistory);
+            RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(state, localPlayerEntity);
+            DashboardSnapshot dashboard = BuildDashboardSnapshot(state, localPlayerEntity, analytics, routePlan, combatHistory);
 
             Snapshot payload = new()
             {
@@ -387,13 +407,19 @@ public static class ProbeModEntry
                 Enemies = enemies,
                 RunContext = runContext,
                 ActionSpace = actionSpace,
-                CombatHistory = combatHistory
+                CombatHistory = combatHistory,
+                Analytics = analytics,
+                RoutePlan = routePlan
             };
 
-            string json = JsonSerializer.Serialize(payload, JsonOptions);
+            string stateJson = JsonSerializer.Serialize(payload, JsonOptions);
+            string analyticsJson = JsonSerializer.Serialize(analytics, JsonOptions);
+            string dashboardJson = JsonSerializer.Serialize(dashboard, JsonOptions);
             lock (FileLock)
             {
-                File.WriteAllText(StateFilePath, json);
+                File.WriteAllText(StateFilePath, stateJson);
+                File.WriteAllText(AnalyticsFilePath, analyticsJson);
+                File.WriteAllText(DashboardFilePath, dashboardJson);
             }
         }
         catch (Exception ex)
@@ -890,18 +916,20 @@ public static class ProbeModEntry
         };
     }
 
-    private static CombatHistorySnapshot BuildCombatHistorySnapshot(CombatState state)
+    private static List<CombatHistoryEntry> GetCombatHistoryEntries()
     {
-        List<CombatHistoryEntry> entries;
         try
         {
-            entries = CombatManager.Instance.History.Entries.ToList();
+            return CombatManager.Instance.History.Entries.ToList();
         }
         catch
         {
-            entries = new List<CombatHistoryEntry>();
+            return new List<CombatHistoryEntry>();
         }
+    }
 
+    private static CombatHistorySnapshot BuildCombatHistorySnapshot(CombatState state, IReadOnlyList<CombatHistoryEntry> entries)
+    {
         int totalEntries = entries.Count;
         int start = Math.Max(0, totalEntries - MaxHistoryEntries);
         List<CombatHistoryEntrySnapshot> recentEntries = new(totalEntries - start);
@@ -943,6 +971,15 @@ public static class ProbeModEntry
                 {
                     AddDetail(details, "combat_card_index", cardId1);
                 }
+                try
+                {
+                    AddDetail(details, "energy_cost", cardPlayStarted.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
+                    AddDetail(details, "star_cost", cardPlayStarted.CardPlay.Card.GetStarCostWithModifiers());
+                }
+                catch
+                {
+                    // Ignore transient card state.
+                }
                 AddDetail(details, "target_combat_id", cardPlayStarted.CardPlay.Target?.CombatId);
                 AddDetail(details, "target_model_id", cardPlayStarted.CardPlay.Target?.ModelId.Entry);
                 break;
@@ -959,6 +996,15 @@ public static class ProbeModEntry
                 AddDetail(details, "play_index", cardPlayFinished.CardPlay.PlayIndex);
                 AddDetail(details, "play_count", cardPlayFinished.CardPlay.PlayCount);
                 AddDetail(details, "was_ethereal", cardPlayFinished.WasEthereal);
+                try
+                {
+                    AddDetail(details, "energy_cost", cardPlayFinished.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
+                    AddDetail(details, "star_cost", cardPlayFinished.CardPlay.Card.GetStarCostWithModifiers());
+                }
+                catch
+                {
+                    // Ignore transient card state.
+                }
                 break;
             case DamageReceivedEntry damageReceived:
                 AddDetail(details, "receiver_combat_id", damageReceived.Receiver.CombatId);
@@ -1051,6 +1097,845 @@ public static class ProbeModEntry
         details[key] = text;
     }
 
+    private static string ResolveModeKey(CombatState state)
+    {
+        return state.Players.Count > 1 ? "multiplayer" : "singleplayer";
+    }
+
+    private static StatsAccumulator EnsureModeTotalsBucket(string modeKey)
+    {
+        if (_modeTotals.TryGetValue(modeKey, out StatsAccumulator? bucket))
+        {
+            return bucket;
+        }
+
+        bucket = new StatsAccumulator();
+        _modeTotals[modeKey] = bucket;
+        return bucket;
+    }
+
+    private static AnalyticsSnapshot UpdateAnalytics(
+        CombatState state,
+        Player? localPlayer,
+        IReadOnlyList<CombatHistoryEntry> historyEntries,
+        CombatHistorySnapshot combatHistory)
+    {
+        string modeKey = ResolveModeKey(state);
+        bool isInCombat = CombatManager.Instance.IsInProgress;
+        uint? localCombatId = localPlayer?.Creature?.CombatId;
+
+        if (isInCombat && !_wasInCombat)
+        {
+            StartNewBattle(state, modeKey);
+        }
+
+        if (!isInCombat && _wasInCombat)
+        {
+            FinalizeActiveBattle(localPlayer, "combat_ended");
+        }
+
+        if (_activeBattle != null && historyEntries.Count < _lastProcessedHistoryEntryCount)
+        {
+            _lastProcessedHistoryEntryCount = 0;
+        }
+
+        if (_activeBattle != null && localCombatId.HasValue)
+        {
+            StatsAccumulator modeTotals = EnsureModeTotalsBucket(_activeBattle.ModeKey);
+            for (int i = _lastProcessedHistoryEntryCount; i < historyEntries.Count; i++)
+            {
+                CombatHistoryEntry entry = historyEntries[i];
+                ProcessHistoryEntryForStats(entry, localCombatId.Value, _totalStats);
+                ProcessHistoryEntryForStats(entry, localCombatId.Value, modeTotals);
+                ProcessHistoryEntryForStats(entry, localCombatId.Value, _activeBattle.Stats);
+            }
+
+            _lastProcessedHistoryEntryCount = historyEntries.Count;
+            _activeBattle.LastUpdatedUtc = DateTime.UtcNow;
+            _activeBattle.LastEnemyAliveCount = state.Enemies.Count(static e => e.IsAlive);
+            _activeBattle.LastRoundNumber = state.RoundNumber;
+            _activeBattle.EncounterId = state.Encounter?.Id.Entry ?? _activeBattle.EncounterId;
+            _activeBattle.EncounterTitle = state.Encounter == null
+                ? _activeBattle.EncounterTitle
+                : SafeText(() => state.Encounter.Title.GetFormattedText(), state.Encounter.Id.Entry);
+            _activeBattle.ActFloor = state.RunState.ActFloor;
+            _activeBattle.TotalFloor = state.RunState.TotalFloor;
+        }
+        else if (!isInCombat)
+        {
+            _lastProcessedHistoryEntryCount = 0;
+        }
+
+        _wasInCombat = isInCombat;
+
+        StatsAccumulator singleTotal = EnsureModeTotalsBucket("singleplayer");
+        StatsAccumulator multiTotal = EnsureModeTotalsBucket("multiplayer");
+        CombatMetricsSnapshot currentCombatMetrics = _activeBattle == null
+            ? new CombatMetricsSnapshot()
+            : BuildMetricsSnapshot(_activeBattle.Stats);
+
+        List<BattleSegmentSnapshot> recentBattles = _battleSegments
+            .TakeLast(20)
+            .Reverse()
+            .ToList();
+
+        List<BattleSegmentSnapshot> recentSingleBattles = _battleSegments
+            .Where(static b => b.Mode == "singleplayer")
+            .TakeLast(12)
+            .Reverse()
+            .ToList();
+
+        List<BattleSegmentSnapshot> recentMultiBattles = _battleSegments
+            .Where(static b => b.Mode == "multiplayer")
+            .TakeLast(12)
+            .Reverse()
+            .ToList();
+
+        AnalyticsSnapshot analytics = new()
+        {
+            ModId = ModId,
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = modeKey,
+            IsInCombat = isInCombat,
+            CurrentCombat = currentCombatMetrics,
+            Total = BuildMetricsSnapshot(_totalStats),
+            Singleplayer = new ModeMetricsSnapshot
+            {
+                Mode = "singleplayer",
+                Total = BuildMetricsSnapshot(singleTotal),
+                RecentBattles = recentSingleBattles
+            },
+            Multiplayer = new ModeMetricsSnapshot
+            {
+                Mode = "multiplayer",
+                Total = BuildMetricsSnapshot(multiTotal),
+                RecentBattles = recentMultiBattles
+            },
+            RecentBattles = recentBattles,
+            RecentCombatLog = BuildRecentCombatLog(combatHistory),
+            Highlights = BuildAnalyticsHighlights(state, localPlayer, currentCombatMetrics, modeKey)
+        };
+
+        return analytics;
+    }
+
+    private static void StartNewBattle(CombatState state, string modeKey)
+    {
+        if (_activeBattle != null)
+        {
+            FinalizeActiveBattle(null, "interrupted");
+        }
+
+        _activeBattle = new BattleSegmentRuntime
+        {
+            CombatId = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)
+                + "_" + state.RunState.TotalFloor.ToString(CultureInfo.InvariantCulture),
+            ModeKey = modeKey,
+            StartedUtc = DateTime.UtcNow,
+            LastUpdatedUtc = DateTime.UtcNow,
+            EncounterId = state.Encounter?.Id.Entry,
+            EncounterTitle = state.Encounter == null
+                ? null
+                : SafeText(() => state.Encounter.Title.GetFormattedText(), state.Encounter.Id.Entry),
+            ActFloor = state.RunState.ActFloor,
+            TotalFloor = state.RunState.TotalFloor,
+            LastEnemyAliveCount = state.Enemies.Count(static e => e.IsAlive),
+            LastRoundNumber = state.RoundNumber
+        };
+        _lastProcessedHistoryEntryCount = 0;
+    }
+
+    private static void FinalizeActiveBattle(Player? localPlayer, string reason)
+    {
+        if (_activeBattle == null)
+        {
+            return;
+        }
+
+        string result = "ended";
+        if (string.Equals(reason, "interrupted", StringComparison.Ordinal))
+        {
+            result = "interrupted";
+        }
+        else if (localPlayer?.Creature != null && localPlayer.Creature.CurrentHp <= 0)
+        {
+            result = "defeat";
+        }
+        else if (_activeBattle.LastEnemyAliveCount <= 0)
+        {
+            result = "victory";
+        }
+
+        BattleSegmentSnapshot segment = new()
+        {
+            CombatId = _activeBattle.CombatId,
+            Mode = _activeBattle.ModeKey,
+            EncounterId = _activeBattle.EncounterId,
+            EncounterTitle = _activeBattle.EncounterTitle,
+            ActFloor = _activeBattle.ActFloor,
+            TotalFloor = _activeBattle.TotalFloor,
+            RoundCount = _activeBattle.LastRoundNumber,
+            StartedAtUtc = _activeBattle.StartedUtc.ToString("O", CultureInfo.InvariantCulture),
+            EndedAtUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            DurationSeconds = (int)Math.Max(0, (DateTime.UtcNow - _activeBattle.StartedUtc).TotalSeconds),
+            Result = result,
+            Metrics = BuildMetricsSnapshot(_activeBattle.Stats)
+        };
+
+        _battleSegments.Add(segment);
+        if (_battleSegments.Count > MaxBattleSegments)
+        {
+            _battleSegments.RemoveAt(0);
+        }
+
+        _activeBattle = null;
+        _lastProcessedHistoryEntryCount = 0;
+    }
+
+    private static void ProcessHistoryEntryForStats(CombatHistoryEntry entry, uint localCombatId, StatsAccumulator stats)
+    {
+        switch (entry)
+        {
+            case CardPlayFinishedEntry cardPlayFinished
+                when cardPlayFinished.Actor.CombatId == localCombatId:
+            {
+                string cardId = cardPlayFinished.CardPlay.Card.Id.Entry;
+                CardStatAccumulator cardStats = GetOrCreateCardStats(stats, cardId);
+                cardStats.Played += 1;
+                stats.CardsPlayed += 1;
+
+                int energyCost = 0;
+                try
+                {
+                    energyCost = Math.Max(0, cardPlayFinished.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
+                }
+                catch
+                {
+                    energyCost = 0;
+                }
+
+                cardStats.EnergySpent += energyCost;
+                break;
+            }
+            case DamageReceivedEntry damageReceived:
+            {
+                int blocked = Math.Max(0, damageReceived.Result.BlockedDamage);
+                int unblocked = Math.Max(0, damageReceived.Result.UnblockedDamage);
+                int total = blocked + unblocked;
+                int overkill = Math.Max(0, damageReceived.Result.OverkillDamage);
+
+                if (damageReceived.Dealer?.CombatId == localCombatId)
+                {
+                    stats.DamageDealt += total;
+                    stats.OverkillDamage += overkill;
+
+                    string? cardSourceId = damageReceived.CardSource?.Id.Entry;
+                    if (!string.IsNullOrEmpty(cardSourceId))
+                    {
+                        CardStatAccumulator cardStats = GetOrCreateCardStats(stats, cardSourceId);
+                        cardStats.DamageDealt += total;
+                        cardStats.OverkillDamage += overkill;
+                    }
+                }
+
+                if (damageReceived.Receiver.CombatId == localCombatId)
+                {
+                    stats.DamageTaken += unblocked;
+                    stats.DamageBlocked += blocked;
+                }
+
+                break;
+            }
+            case BlockGainedEntry blockGained
+                when blockGained.Receiver.CombatId == localCombatId:
+            {
+                int amount = Math.Max(0, blockGained.Amount);
+                stats.BlockGained += amount;
+
+                string? cardId = blockGained.CardPlay?.Card.Id.Entry;
+                if (!string.IsNullOrEmpty(cardId))
+                {
+                    CardStatAccumulator cardStats = GetOrCreateCardStats(stats, cardId);
+                    cardStats.BlockGained += amount;
+                }
+                break;
+            }
+            case EnergySpentEntry energySpent
+                when energySpent.Actor.CombatId == localCombatId:
+                stats.EnergySpent += Math.Max(0, energySpent.Amount);
+                break;
+            case PowerReceivedEntry powerReceived
+                when powerReceived.Applier?.CombatId == localCombatId:
+            {
+                string powerId = powerReceived.Power.Id.Entry;
+                string category = ResolvePowerCategory(powerId);
+                if (category == "buff")
+                {
+                    stats.BuffsApplied += 1;
+                    IncrementCount(stats.BuffCounts, powerId);
+                }
+                else if (category == "debuff")
+                {
+                    stats.DebuffsApplied += 1;
+                    IncrementCount(stats.DebuffCounts, powerId);
+                }
+                break;
+            }
+        }
+    }
+
+    private static CardStatAccumulator GetOrCreateCardStats(StatsAccumulator stats, string cardId)
+    {
+        if (stats.CardStats.TryGetValue(cardId, out CardStatAccumulator? existing))
+        {
+            return existing;
+        }
+
+        CardStatAccumulator created = new()
+        {
+            CardId = cardId
+        };
+        stats.CardStats[cardId] = created;
+        return created;
+    }
+
+    private static void IncrementCount(IDictionary<string, int> counts, string key)
+    {
+        if (counts.TryGetValue(key, out int current))
+        {
+            counts[key] = current + 1;
+            return;
+        }
+
+        counts[key] = 1;
+    }
+
+    private static string ResolvePowerCategory(string powerId)
+    {
+        if (!_powerTypeCache.TryGetValue(powerId, out string? powerType))
+        {
+            PowerModel? model = ModelDb.AllPowers.FirstOrDefault(p => string.Equals(p.Id.Entry, powerId, StringComparison.Ordinal));
+            powerType = model?.Type.ToString() ?? string.Empty;
+            _powerTypeCache[powerId] = powerType;
+        }
+
+        string lower = powerType.ToLowerInvariant();
+        if (lower.Contains("debuff", StringComparison.Ordinal) || lower.Contains("negative", StringComparison.Ordinal))
+        {
+            return "debuff";
+        }
+
+        if (lower.Contains("buff", StringComparison.Ordinal) || lower.Contains("positive", StringComparison.Ordinal))
+        {
+            return "buff";
+        }
+
+        return "other";
+    }
+
+    private static CombatMetricsSnapshot BuildMetricsSnapshot(StatsAccumulator stats)
+    {
+        int totalCardPlays = Math.Max(0, stats.CardsPlayed);
+        List<CardMetricSnapshot> topCards = stats.CardStats.Values
+            .Select(card =>
+            {
+                double usageRate = totalCardPlays <= 0 ? 0 : (double)card.Played / totalCardPlays;
+                double efficiency = card.EnergySpent <= 0 ? 0 : (double)card.DamageDealt / card.EnergySpent;
+                return new CardMetricSnapshot
+                {
+                    CardId = card.CardId,
+                    Played = card.Played,
+                    UsageRate = Math.Round(usageRate, 4),
+                    DamageDealt = card.DamageDealt,
+                    BlockGained = card.BlockGained,
+                    OverkillDamage = card.OverkillDamage,
+                    EnergySpent = card.EnergySpent,
+                    DamagePerEnergy = Math.Round(efficiency, 4)
+                };
+            })
+            .OrderByDescending(static card => card.Played)
+            .ThenByDescending(static card => card.DamageDealt)
+            .ThenBy(static card => card.CardId, StringComparer.Ordinal)
+            .Take(15)
+            .ToList();
+
+        List<PowerCountSnapshot> topBuffs = stats.BuffCounts
+            .OrderByDescending(static pair => pair.Value)
+            .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+            .Take(10)
+            .Select(static pair => new PowerCountSnapshot
+            {
+                PowerId = pair.Key,
+                Count = pair.Value
+            })
+            .ToList();
+
+        List<PowerCountSnapshot> topDebuffs = stats.DebuffCounts
+            .OrderByDescending(static pair => pair.Value)
+            .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+            .Take(10)
+            .Select(static pair => new PowerCountSnapshot
+            {
+                PowerId = pair.Key,
+                Count = pair.Value
+            })
+            .ToList();
+
+        return new CombatMetricsSnapshot
+        {
+            DamageDealt = stats.DamageDealt,
+            DamageTaken = stats.DamageTaken,
+            DamageBlocked = stats.DamageBlocked,
+            BlockGained = stats.BlockGained,
+            EnergySpent = stats.EnergySpent,
+            OverkillDamage = stats.OverkillDamage,
+            CardsPlayed = stats.CardsPlayed,
+            BuffsApplied = stats.BuffsApplied,
+            DebuffsApplied = stats.DebuffsApplied,
+            DamagePerEnergy = Math.Round(SafeDivide(stats.DamageDealt, stats.EnergySpent), 4),
+            TempoScore = stats.DamageDealt - stats.DamageTaken,
+            TopCards = topCards,
+            TopBuffs = topBuffs,
+            TopDebuffs = topDebuffs
+        };
+    }
+
+    private static List<CombatLogLineSnapshot> BuildRecentCombatLog(CombatHistorySnapshot combatHistory)
+    {
+        return combatHistory.RecentEntries
+            .TakeLast(MaxDashboardLogEntries)
+            .Select(entry =>
+            {
+                string details = string.Join(
+                    ", ",
+                    entry.Details.Take(4).Select(static pair => pair.Key + "=" + pair.Value));
+                return new CombatLogLineSnapshot
+                {
+                    Index = entry.Index,
+                    EntryType = entry.EntryType,
+                    Actor = entry.ActorName,
+                    Description = entry.HumanReadable,
+                    Details = details
+                };
+            })
+            .ToList();
+    }
+
+    private static AnalyticsHighlightsSnapshot BuildAnalyticsHighlights(
+        CombatState state,
+        Player? localPlayer,
+        CombatMetricsSnapshot currentCombat,
+        string modeKey)
+    {
+        int incomingDamage = EstimateIncomingDamage(state);
+        int hp = localPlayer?.Creature.CurrentHp ?? 0;
+        int block = localPlayer?.Creature.Block ?? 0;
+        int unblockedThreat = Math.Max(0, incomingDamage - block);
+
+        string dangerLevel = "low";
+        if (unblockedThreat >= hp && hp > 0)
+        {
+            dangerLevel = "lethal";
+        }
+        else if (unblockedThreat >= Math.Max(1, hp / 2))
+        {
+            dangerLevel = "high";
+        }
+        else if (unblockedThreat > 0)
+        {
+            dangerLevel = "medium";
+        }
+
+        string? mvpCard = currentCombat.TopCards.FirstOrDefault()?.CardId;
+        int recentVictories = _battleSegments
+            .TakeLast(8)
+            .Count(static b => string.Equals(b.Result, "victory", StringComparison.Ordinal));
+
+        return new AnalyticsHighlightsSnapshot
+        {
+            Mode = modeKey,
+            IncomingDamageEstimate = incomingDamage,
+            UnblockedThreatEstimate = unblockedThreat,
+            DangerLevel = dangerLevel,
+            CurrentTempo = currentCombat.TempoScore,
+            MvpCard = mvpCard,
+            RecentWinCount = recentVictories,
+            RecentBattleCount = Math.Min(8, _battleSegments.Count)
+        };
+    }
+
+    private static int EstimateIncomingDamage(CombatState state)
+    {
+        int sum = 0;
+        foreach (Creature enemy in state.Enemies)
+        {
+            if (!enemy.IsAlive || enemy.Monster?.NextMove?.Intents == null)
+            {
+                continue;
+            }
+
+            foreach (AbstractIntent intent in enemy.Monster.NextMove.Intents)
+            {
+                string? label = null;
+                try
+                {
+                    label = intent.GetIntentLabel(state.PlayerCreatures, enemy).GetFormattedText();
+                }
+                catch
+                {
+                    label = null;
+                }
+
+                sum += ParseFirstInteger(label);
+            }
+        }
+
+        return sum;
+    }
+
+    private static int ParseFirstInteger(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return 0;
+        }
+
+        int start = -1;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (char.IsDigit(text[i]))
+            {
+                start = i;
+                break;
+            }
+        }
+
+        if (start < 0)
+        {
+            return 0;
+        }
+
+        int end = start;
+        while (end < text.Length && char.IsDigit(text[end]))
+        {
+            end++;
+        }
+
+        string token = text[start..end];
+        if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value))
+        {
+            return value;
+        }
+
+        return 0;
+    }
+
+    private static DashboardSnapshot BuildDashboardSnapshot(
+        CombatState state,
+        Player? localPlayer,
+        AnalyticsSnapshot analytics,
+        RoutePlanSnapshot routePlan,
+        CombatHistorySnapshot combatHistory)
+    {
+        DashboardSnapshot dashboard = new()
+        {
+            ModId = ModId,
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = analytics.Mode,
+            IsInCombat = analytics.IsInCombat,
+            CurrentCombat = analytics.CurrentCombat,
+            Total = analytics.Total,
+            SingleplayerTotal = analytics.Singleplayer.Total,
+            MultiplayerTotal = analytics.Multiplayer.Total,
+            RecentBattles = analytics.RecentBattles.Take(10).ToList(),
+            RecentCombatLog = analytics.RecentCombatLog,
+            RoutePlan = routePlan,
+            Summary = BuildDashboardSummary(analytics, localPlayer),
+            Alerts = BuildDashboardAlerts(analytics),
+            FunInsights = BuildFunInsights(state, analytics, combatHistory)
+        };
+
+        return dashboard;
+    }
+
+    private static string BuildDashboardSummary(AnalyticsSnapshot analytics, Player? localPlayer)
+    {
+        int hp = localPlayer?.Creature.CurrentHp ?? 0;
+        int maxHp = localPlayer?.Creature.MaxHp ?? 0;
+        int energy = localPlayer?.PlayerCombatState?.Energy ?? 0;
+        CombatMetricsSnapshot current = analytics.CurrentCombat;
+        return $"HP {hp}/{maxHp}, Energy {energy}, Dmg {current.DamageDealt}, Block {current.BlockGained}, Overkill {current.OverkillDamage}, Cards {current.CardsPlayed}";
+    }
+
+    private static List<string> BuildDashboardAlerts(AnalyticsSnapshot analytics)
+    {
+        List<string> alerts = new();
+        if (analytics.Highlights.DangerLevel == "lethal")
+        {
+            alerts.Add("本回合存在致死风险，优先防守或减伤。");
+        }
+
+        if (analytics.CurrentCombat.EnergySpent > 0 && analytics.CurrentCombat.DamagePerEnergy < 1.0)
+        {
+            alerts.Add("当前能量效率偏低，优先寻找高收益出牌。");
+        }
+
+        if (analytics.CurrentCombat.CardsPlayed > 0 && analytics.CurrentCombat.BuffsApplied + analytics.CurrentCombat.DebuffsApplied == 0)
+        {
+            alerts.Add("本战斗尚未建立增益/减益节奏。");
+        }
+
+        return alerts;
+    }
+
+    private static List<string> BuildFunInsights(
+        CombatState state,
+        AnalyticsSnapshot analytics,
+        CombatHistorySnapshot combatHistory)
+    {
+        List<string> insights = new();
+        CardMetricSnapshot? topCard = analytics.CurrentCombat.TopCards.FirstOrDefault();
+        if (topCard != null && topCard.Played >= 2)
+        {
+            insights.Add($"本战斗最常用卡是 {topCard.CardId}，使用 {topCard.Played} 次。");
+        }
+
+        if (analytics.Total.CardsPlayed > 0)
+        {
+            insights.Add($"总计能量效率 {analytics.Total.DamagePerEnergy:F2} 伤害/能量。");
+        }
+
+        int uniqueEntryTypes = combatHistory.RecentEntries
+            .Select(static e => e.EntryType)
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+        insights.Add($"最近战斗日志类型数：{uniqueEntryTypes}。");
+
+        if (state.Players.Count > 1)
+        {
+            insights.Add("当前处于联机战斗统计通道。");
+        }
+        else
+        {
+            insights.Add("当前处于单机战斗统计通道。");
+        }
+
+        return insights;
+    }
+
+    private static RoutePlanSnapshot BuildRoutePlanSnapshot(CombatState state, Player? localPlayer)
+    {
+        IRunState runState = state.RunState;
+        double hpRatio = 1;
+        if (localPlayer != null && localPlayer.Creature.MaxHp > 0)
+        {
+            hpRatio = Math.Clamp((double)localPlayer.Creature.CurrentHp / localPlayer.Creature.MaxHp, 0, 1);
+        }
+
+        int gold = localPlayer?.Gold ?? 0;
+        RoutePlanSnapshot snapshot = new()
+        {
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = ResolveModeKey(state),
+            CurrentFloor = runState.TotalFloor,
+            HpRatio = Math.Round(hpRatio, 4),
+            Strategy = BuildRouteStrategy(hpRatio, gold),
+            HasMapContext = runState.CurrentMapPoint != null,
+            Options = new List<RouteOptionSnapshot>()
+        };
+
+        if (runState.CurrentMapPoint == null)
+        {
+            return snapshot;
+        }
+
+        IEnumerable<MapPoint> children = runState.CurrentMapPoint.Children
+            .OrderBy(static c => c.coord.row)
+            .ThenBy(static c => c.coord.col);
+
+        foreach (MapPoint child in children)
+        {
+            RouteEval eval = EvaluateRoute(child, 1, hpRatio, gold);
+            List<string> preview = eval.PathTypes.Take(6).ToList();
+            RouteOptionSnapshot option = new()
+            {
+                Coord = new MapCoordSnapshot
+                {
+                    Col = child.coord.col,
+                    Row = child.coord.row
+                },
+                PointType = child.PointType.ToString(),
+                Score = Math.Round(eval.Score, 4),
+                RiskTag = BuildRiskTag(child.PointType.ToString(), hpRatio),
+                PathPreview = preview,
+                Reasons = BuildRouteReasons(child.PointType.ToString(), hpRatio, gold)
+            };
+            snapshot.Options.Add(option);
+        }
+
+        snapshot.Options = snapshot.Options
+            .OrderByDescending(static o => o.Score)
+            .ThenBy(static o => o.Coord.Row)
+            .ThenBy(static o => o.Coord.Col)
+            .ToList();
+        snapshot.Suggested = snapshot.Options.FirstOrDefault();
+        return snapshot;
+    }
+
+    private static RouteEval EvaluateRoute(MapPoint point, int depth, double hpRatio, int gold)
+    {
+        string pointType = point.PointType.ToString();
+        double ownScore = ScoreMapPointType(pointType, hpRatio, gold);
+        RouteEval current = new()
+        {
+            Score = ownScore,
+            PathTypes = new List<string> { pointType }
+        };
+
+        if (depth >= RoutePlanDepth || point.Children.Count == 0)
+        {
+            return current;
+        }
+
+        RouteEval? bestChild = null;
+        foreach (MapPoint child in point.Children)
+        {
+            RouteEval candidate = EvaluateRoute(child, depth + 1, hpRatio, gold);
+            if (bestChild == null || candidate.Score > bestChild.Score)
+            {
+                bestChild = candidate;
+            }
+        }
+
+        if (bestChild == null)
+        {
+            return current;
+        }
+
+        current.Score = ownScore + bestChild.Score * 0.82;
+        current.PathTypes.AddRange(bestChild.PathTypes);
+        return current;
+    }
+
+    private static double ScoreMapPointType(string pointType, double hpRatio, int gold)
+    {
+        string lower = pointType.ToLowerInvariant();
+        if (lower.Contains("elite", StringComparison.Ordinal))
+        {
+            return hpRatio >= 0.65 ? 2.3 : -1.5;
+        }
+
+        if (lower.Contains("rest", StringComparison.Ordinal) || lower.Contains("camp", StringComparison.Ordinal))
+        {
+            return hpRatio < 0.55 ? 2.4 : 0.7;
+        }
+
+        if (lower.Contains("shop", StringComparison.Ordinal))
+        {
+            return gold >= 150 ? 1.7 : 0.8;
+        }
+
+        if (lower.Contains("boss", StringComparison.Ordinal))
+        {
+            return hpRatio >= 0.6 ? 2.0 : 1.0;
+        }
+
+        if (lower.Contains("treasure", StringComparison.Ordinal) || lower.Contains("chest", StringComparison.Ordinal))
+        {
+            return 1.8;
+        }
+
+        if (lower.Contains("event", StringComparison.Ordinal) || lower.Contains("question", StringComparison.Ordinal))
+        {
+            return 1.2;
+        }
+
+        if (lower.Contains("combat", StringComparison.Ordinal) || lower.Contains("monster", StringComparison.Ordinal))
+        {
+            return hpRatio >= 0.4 ? 1.1 : 0.5;
+        }
+
+        return 0.7;
+    }
+
+    private static string BuildRouteStrategy(double hpRatio, int gold)
+    {
+        if (hpRatio < 0.4)
+        {
+            return "survival";
+        }
+
+        if (gold >= 200)
+        {
+            return "economy";
+        }
+
+        return "balanced";
+    }
+
+    private static string BuildRiskTag(string pointType, double hpRatio)
+    {
+        string lower = pointType.ToLowerInvariant();
+        if (lower.Contains("elite", StringComparison.Ordinal))
+        {
+            return hpRatio < 0.6 ? "high" : "medium";
+        }
+
+        if (lower.Contains("boss", StringComparison.Ordinal))
+        {
+            return hpRatio < 0.55 ? "high" : "medium";
+        }
+
+        if (lower.Contains("rest", StringComparison.Ordinal) || lower.Contains("camp", StringComparison.Ordinal))
+        {
+            return "low";
+        }
+
+        return "medium";
+    }
+
+    private static List<string> BuildRouteReasons(string pointType, double hpRatio, int gold)
+    {
+        List<string> reasons = new();
+        string lower = pointType.ToLowerInvariant();
+        if (lower.Contains("elite", StringComparison.Ordinal))
+        {
+            reasons.Add(hpRatio >= 0.65 ? "血线健康，可争取高收益精英。" : "当前血线偏低，精英风险较高。");
+        }
+        else if (lower.Contains("rest", StringComparison.Ordinal) || lower.Contains("camp", StringComparison.Ordinal))
+        {
+            reasons.Add(hpRatio < 0.55 ? "优先回复，提升后续容错。" : "可选择升级或维持节奏。");
+        }
+        else if (lower.Contains("shop", StringComparison.Ordinal))
+        {
+            reasons.Add(gold >= 150 ? "金币充足，商店性价比高。" : "金币不足，商店收益一般。");
+        }
+        else if (lower.Contains("event", StringComparison.Ordinal) || lower.Contains("question", StringComparison.Ordinal))
+        {
+            reasons.Add("事件点弹性高，适合寻找局外收益。");
+        }
+        else if (lower.Contains("treasure", StringComparison.Ordinal) || lower.Contains("chest", StringComparison.Ordinal))
+        {
+            reasons.Add("宝箱节点稳定提供遗物收益。");
+        }
+        else
+        {
+            reasons.Add("常规推进节点。");
+        }
+
+        return reasons;
+    }
+
+    private static double SafeDivide(int numerator, int denominator)
+    {
+        if (denominator <= 0)
+        {
+            return 0;
+        }
+
+        return (double)numerator / denominator;
+    }
+
     private static void WriteStatus(string phase, string message)
     {
         try
@@ -1115,6 +2000,8 @@ public static class ProbeModEntry
         public RunContextSnapshot RunContext { get; set; } = new();
         public ActionSpaceSnapshot ActionSpace { get; set; } = new();
         public CombatHistorySnapshot CombatHistory { get; set; } = new();
+        public AnalyticsSnapshot Analytics { get; set; } = new();
+        public RoutePlanSnapshot RoutePlan { get; set; } = new();
     }
 
     private sealed class StatusSnapshot
@@ -1374,6 +2261,188 @@ public static class ProbeModEntry
         public string Description { get; set; } = string.Empty;
         public string HumanReadable { get; set; } = string.Empty;
         public Dictionary<string, string?> Details { get; set; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class StatsAccumulator
+    {
+        public int DamageDealt { get; set; }
+        public int DamageTaken { get; set; }
+        public int DamageBlocked { get; set; }
+        public int BlockGained { get; set; }
+        public int EnergySpent { get; set; }
+        public int OverkillDamage { get; set; }
+        public int CardsPlayed { get; set; }
+        public int BuffsApplied { get; set; }
+        public int DebuffsApplied { get; set; }
+        public Dictionary<string, CardStatAccumulator> CardStats { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, int> BuffCounts { get; } = new(StringComparer.Ordinal);
+        public Dictionary<string, int> DebuffCounts { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed class CardStatAccumulator
+    {
+        public string CardId { get; set; } = string.Empty;
+        public int Played { get; set; }
+        public int DamageDealt { get; set; }
+        public int BlockGained { get; set; }
+        public int OverkillDamage { get; set; }
+        public int EnergySpent { get; set; }
+    }
+
+    private sealed class BattleSegmentRuntime
+    {
+        public string CombatId { get; set; } = string.Empty;
+        public string ModeKey { get; set; } = "singleplayer";
+        public DateTime StartedUtc { get; set; }
+        public DateTime LastUpdatedUtc { get; set; }
+        public string? EncounterId { get; set; }
+        public string? EncounterTitle { get; set; }
+        public int ActFloor { get; set; }
+        public int TotalFloor { get; set; }
+        public int LastEnemyAliveCount { get; set; }
+        public int LastRoundNumber { get; set; }
+        public StatsAccumulator Stats { get; } = new();
+    }
+
+    private sealed class AnalyticsSnapshot
+    {
+        public string ModId { get; set; } = string.Empty;
+        public string TimestampUtc { get; set; } = string.Empty;
+        public string Mode { get; set; } = "singleplayer";
+        public bool IsInCombat { get; set; }
+        public CombatMetricsSnapshot CurrentCombat { get; set; } = new();
+        public CombatMetricsSnapshot Total { get; set; } = new();
+        public ModeMetricsSnapshot Singleplayer { get; set; } = new();
+        public ModeMetricsSnapshot Multiplayer { get; set; } = new();
+        public List<BattleSegmentSnapshot> RecentBattles { get; set; } = new();
+        public List<CombatLogLineSnapshot> RecentCombatLog { get; set; } = new();
+        public AnalyticsHighlightsSnapshot Highlights { get; set; } = new();
+    }
+
+    private sealed class ModeMetricsSnapshot
+    {
+        public string Mode { get; set; } = string.Empty;
+        public CombatMetricsSnapshot Total { get; set; } = new();
+        public List<BattleSegmentSnapshot> RecentBattles { get; set; } = new();
+    }
+
+    private sealed class AnalyticsHighlightsSnapshot
+    {
+        public string Mode { get; set; } = string.Empty;
+        public int IncomingDamageEstimate { get; set; }
+        public int UnblockedThreatEstimate { get; set; }
+        public string DangerLevel { get; set; } = "low";
+        public int CurrentTempo { get; set; }
+        public string? MvpCard { get; set; }
+        public int RecentWinCount { get; set; }
+        public int RecentBattleCount { get; set; }
+    }
+
+    private sealed class CombatMetricsSnapshot
+    {
+        public int DamageDealt { get; set; }
+        public int DamageTaken { get; set; }
+        public int DamageBlocked { get; set; }
+        public int BlockGained { get; set; }
+        public int EnergySpent { get; set; }
+        public int OverkillDamage { get; set; }
+        public int CardsPlayed { get; set; }
+        public int BuffsApplied { get; set; }
+        public int DebuffsApplied { get; set; }
+        public double DamagePerEnergy { get; set; }
+        public int TempoScore { get; set; }
+        public List<CardMetricSnapshot> TopCards { get; set; } = new();
+        public List<PowerCountSnapshot> TopBuffs { get; set; } = new();
+        public List<PowerCountSnapshot> TopDebuffs { get; set; } = new();
+    }
+
+    private sealed class CardMetricSnapshot
+    {
+        public string CardId { get; set; } = string.Empty;
+        public int Played { get; set; }
+        public double UsageRate { get; set; }
+        public int DamageDealt { get; set; }
+        public int BlockGained { get; set; }
+        public int OverkillDamage { get; set; }
+        public int EnergySpent { get; set; }
+        public double DamagePerEnergy { get; set; }
+    }
+
+    private sealed class PowerCountSnapshot
+    {
+        public string PowerId { get; set; } = string.Empty;
+        public int Count { get; set; }
+    }
+
+    private sealed class CombatLogLineSnapshot
+    {
+        public int Index { get; set; }
+        public string EntryType { get; set; } = string.Empty;
+        public string Actor { get; set; } = string.Empty;
+        public string Description { get; set; } = string.Empty;
+        public string Details { get; set; } = string.Empty;
+    }
+
+    private sealed class BattleSegmentSnapshot
+    {
+        public string CombatId { get; set; } = string.Empty;
+        public string Mode { get; set; } = string.Empty;
+        public string? EncounterId { get; set; }
+        public string? EncounterTitle { get; set; }
+        public int ActFloor { get; set; }
+        public int TotalFloor { get; set; }
+        public int RoundCount { get; set; }
+        public string StartedAtUtc { get; set; } = string.Empty;
+        public string EndedAtUtc { get; set; } = string.Empty;
+        public int DurationSeconds { get; set; }
+        public string Result { get; set; } = string.Empty;
+        public CombatMetricsSnapshot Metrics { get; set; } = new();
+    }
+
+    private sealed class RoutePlanSnapshot
+    {
+        public string TimestampUtc { get; set; } = string.Empty;
+        public string Mode { get; set; } = "singleplayer";
+        public int CurrentFloor { get; set; }
+        public bool HasMapContext { get; set; }
+        public double HpRatio { get; set; }
+        public string Strategy { get; set; } = "balanced";
+        public RouteOptionSnapshot? Suggested { get; set; }
+        public List<RouteOptionSnapshot> Options { get; set; } = new();
+    }
+
+    private sealed class RouteOptionSnapshot
+    {
+        public MapCoordSnapshot Coord { get; set; } = new();
+        public string PointType { get; set; } = string.Empty;
+        public double Score { get; set; }
+        public string RiskTag { get; set; } = string.Empty;
+        public List<string> PathPreview { get; set; } = new();
+        public List<string> Reasons { get; set; } = new();
+    }
+
+    private sealed class DashboardSnapshot
+    {
+        public string ModId { get; set; } = string.Empty;
+        public string TimestampUtc { get; set; } = string.Empty;
+        public string Mode { get; set; } = string.Empty;
+        public bool IsInCombat { get; set; }
+        public string Summary { get; set; } = string.Empty;
+        public List<string> Alerts { get; set; } = new();
+        public List<string> FunInsights { get; set; } = new();
+        public CombatMetricsSnapshot CurrentCombat { get; set; } = new();
+        public CombatMetricsSnapshot Total { get; set; } = new();
+        public CombatMetricsSnapshot SingleplayerTotal { get; set; } = new();
+        public CombatMetricsSnapshot MultiplayerTotal { get; set; } = new();
+        public RoutePlanSnapshot RoutePlan { get; set; } = new();
+        public List<BattleSegmentSnapshot> RecentBattles { get; set; } = new();
+        public List<CombatLogLineSnapshot> RecentCombatLog { get; set; } = new();
+    }
+
+    private sealed class RouteEval
+    {
+        public double Score { get; set; }
+        public List<string> PathTypes { get; set; } = new();
     }
 
     private sealed class DictionarySnapshot

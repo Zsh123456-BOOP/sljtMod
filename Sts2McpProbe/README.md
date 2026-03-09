@@ -29,6 +29,8 @@
 - `status.json`
 - `state.json`
 - `dictionary.json`
+- `analytics.json`（当前战斗 / 总计 / 单机 / 联机 / 分场统计）
+- `dashboard.json`（一屏仪表盘汇总）
 - `probe.log`
 
 ## 3) 命令文件格式
@@ -63,7 +65,7 @@
 
 这样你可以让 LLM 和自动出牌层用英文键交互，同时在 UI 对话层展示中文。
 
-## 5) `state.json` 新增结构（LLM 决策）
+## 5) `state.json` 新增结构（LLM 决策 + 统计）
 
 为了支持“边打边聊 + 稳定决策”，`state.json` 现在还包含：
 
@@ -80,8 +82,40 @@
 - `CombatHistory`
   - 最近事件流（默认最多 80 条）
   - 每条含 `EntryType`、`Description`、`Details`
+- `Analytics`
+  - `CurrentCombat`：当前战斗统计
+  - `Total`：累计统计
+  - `Singleplayer` / `Multiplayer`：按模式拆分累计与近期战斗
+  - `RecentBattles`：分场战斗摘要
+  - `Highlights`：危险度、节奏、MVP 卡等
+- `RoutePlan`
+  - 当前地图分叉评分、风险标签、建议路线与理由
 
-## 6) 关键注意
+## 6) `analytics.json` 指标说明
+
+覆盖你要求的核心项：
+
+- 伤害 / 格挡 / 能量 / 过量伤害
+- 卡牌使用率（按卡牌统计 `Played` + `UsageRate`）
+- 卡牌能量效率（`DamagePerEnergy`）
+- Buff / Debuff 施加统计
+- 战斗日志（最近事件简表）
+- 当前战斗 / 总计 / 每场分片（`RecentBattles`）
+- 单机与联机分通道统计（`Singleplayer`、`Multiplayer`）
+
+## 7) `dashboard.json`（一屏看全部）
+
+用于桌宠或前端直接渲染：
+
+- `Summary`：核心一句话概览
+- `Alerts`：风险提示（如致死风险、能量效率低）
+- `CurrentCombat` / `Total` / `SingleplayerTotal` / `MultiplayerTotal`
+- `RecentBattles`（最近 10 场）
+- `RecentCombatLog`（最近 30 条）
+- `RoutePlan`（路线建议）
+- `FunInsights`（趣味洞察）
+
+## 8) 关键注意
 
 游戏内置 Mod 加载器要求同名的：
 - `Sts2Mcp.pck`
@@ -89,7 +123,7 @@
 
 `build.ps1` 已自动完成 `pck` 打包（调用 `SlayTheSpire2.exe --headless --script`）。
 
-## 7) 策略引擎（无模型）
+## 9) 策略引擎（无模型）
 
 如果你要做“规则 + 打分 + 在线权重更新”的自动决策，请看：
 
