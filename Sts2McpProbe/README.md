@@ -154,3 +154,54 @@
 如果你要做“规则 + 打分 + 在线权重更新”的自动决策，请看：
 
 `..\Sts2DecisionEngine\README.md`
+
+## 11) 一键打包与一键安装（Windows）
+
+### 开发者打包（发给别人）
+
+在游戏根目录执行：
+
+```powershell
+.\ModDev\Sts2McpProbe\package_release.bat
+```
+
+或：
+
+```powershell
+.\ModDev\Sts2McpProbe\package_release.ps1 -Configuration Release
+```
+
+输出：
+- 目录：`ModDev\Sts2McpProbe\dist\Sts2McpInstaller\`
+- 压缩包：`ModDev\Sts2McpProbe\dist\Sts2McpInstaller_yyyyMMdd_HHmmss.zip`
+
+### 用户安装（目标电脑）
+
+解压后双击：
+
+`Install-Sts2Mcp.bat`
+
+安装器会自动：
+- 检测 Steam 目录（注册表 + 常见默认路径）
+- 读取 `libraryfolders.vdf`
+- 读取 `appmanifest_2868840.acf` 定位 STS2 目录
+- 自动备份旧 `mods\Sts2Mcp`
+- 安装 `Sts2Mcp.dll` 与 `Sts2Mcp.pck`
+
+手动指定游戏路径示例：
+
+```bat
+Install-Sts2Mcp.bat "D:\SteamLibrary\steamapps\common\Slay the Spire 2"
+```
+
+### 卸载
+
+```bat
+Uninstall-Sts2Mcp.bat
+```
+
+卸载并恢复最近备份：
+
+```bat
+Uninstall-Sts2Mcp.bat -RestoreLatestBackup
+```
