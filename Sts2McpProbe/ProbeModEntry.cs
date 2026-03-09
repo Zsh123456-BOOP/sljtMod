@@ -64,12 +64,25 @@ public static class ProbeModEntry
     private static readonly string DashboardFilePath = Path.Combine(WorkDir, "dashboard.json");
     private static readonly string CommandFilePath = Path.Combine(WorkDir, "command.json");
     private static readonly string ProbeLogPath = Path.Combine(WorkDir, "probe.log");
+    private static readonly string ModsProbeLogPath = ResolveModsProbeLogPath();
 
     public static void Initialize()
     {
         Directory.CreateDirectory(WorkDir);
         SafeLog("Initialize() invoked.");
         WriteStatus("initialized", "Mod initialized successfully.");
+        ProbeOverlayManager.SetLogger(SafeLog);
+        ProbeOverlayManager.Update(new OverlayPayload
+        {
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = "singleplayer",
+            IsInCombat = false,
+            Summary = "Mod 已加载，等待战斗数据...",
+            CombatPanel = "等待进入战斗...",
+            TotalPanel = "等待累计统计...",
+            RoutePanel = "等待路线数据...",
+            LogsPanel = "等待战斗日志..."
+        });
         InstallHooks();
         TryDumpDictionary(force: true);
     }
@@ -392,7 +405,7 @@ public static class ProbeModEntry
             RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(state, localPlayerEntity);
             analytics.RouteHistory = routePlan.HistoricalStats;
             DashboardSnapshot dashboard = BuildDashboardSnapshot(state, localPlayerEntity, analytics, routePlan, combatHistory);
-            OverlayPayload overlayPayload = BuildOverlayPayload(localPlayerEntity, analytics, routePlan, combatHistory);
+            OverlayPayload overlayPayload = BuildOverlayPayload(state, historyEntries, localPlayerEntity, analytics, routePlan, combatHistory);
 
             Snapshot payload = new()
             {
@@ -940,7 +953,14 @@ public static class ProbeModEntry
         for (int i = start; i < totalEntries; i++)
         {
             CombatHistoryEntry entry = entries[i];
-            recentEntries.Add(BuildCombatHistoryEntrySnapshot(entry, state, i));
+            try
+            {
+                recentEntries.Add(BuildCombatHistoryEntrySnapshot(entry, state, i));
+            }
+            catch (Exception ex)
+            {
+                recentEntries.Add(BuildCombatHistoryEntryErrorSnapshot(entry, i, ex));
+            }
         }
 
         return new CombatHistorySnapshot
@@ -952,137 +972,191 @@ public static class ProbeModEntry
 
     private static CombatHistoryEntrySnapshot BuildCombatHistoryEntrySnapshot(CombatHistoryEntry entry, CombatState state, int index)
     {
+        string actorModelId = string.Empty;
+        string actorName = string.Empty;
+        uint? actorCombatId = null;
+        try
+        {
+            if (entry.Actor != null)
+            {
+                actorCombatId = entry.Actor.CombatId;
+                actorModelId = entry.Actor.ModelId.Entry;
+                actorName = entry.Actor.Name;
+            }
+        }
+        catch
+        {
+            // Ignore transient actor state.
+        }
+
+        bool happenedThisTurn = false;
+        try
+        {
+            happenedThisTurn = entry.HappenedThisTurn(state);
+        }
+        catch
+        {
+            // Ignore history helper failures.
+        }
+
+        string description = SafeText(() => entry.Description);
+        string humanReadable = SafeText(() => entry.HumanReadableString);
+
         CombatHistoryEntrySnapshot snapshot = new()
         {
             Index = index,
             EntryType = entry.GetType().Name,
             RoundNumber = entry.RoundNumber,
             CurrentSide = entry.CurrentSide.ToString(),
-            ActorCombatId = entry.Actor.CombatId,
-            ActorModelId = entry.Actor.ModelId.Entry,
-            ActorName = entry.Actor.Name,
-            HappenedThisTurn = entry.HappenedThisTurn(state),
-            Description = entry.Description,
-            HumanReadable = entry.HumanReadableString
+            ActorCombatId = actorCombatId,
+            ActorModelId = actorModelId,
+            ActorName = actorName,
+            HappenedThisTurn = happenedThisTurn,
+            Description = description,
+            HumanReadable = humanReadable
         };
 
         Dictionary<string, string?> details = snapshot.Details;
-        switch (entry)
+        try
         {
-            case CardPlayStartedEntry cardPlayStarted:
-                AddDetail(details, "card_id", cardPlayStarted.CardPlay.Card.Id.Entry);
-                if (NetCombatCardDb.Instance.TryGetCardId(cardPlayStarted.CardPlay.Card, out uint cardId1))
-                {
-                    AddDetail(details, "combat_card_index", cardId1);
-                }
-                try
-                {
-                    AddDetail(details, "energy_cost", cardPlayStarted.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
-                    AddDetail(details, "star_cost", cardPlayStarted.CardPlay.Card.GetStarCostWithModifiers());
-                }
-                catch
-                {
-                    // Ignore transient card state.
-                }
-                AddDetail(details, "target_combat_id", cardPlayStarted.CardPlay.Target?.CombatId);
-                AddDetail(details, "target_model_id", cardPlayStarted.CardPlay.Target?.ModelId.Entry);
-                break;
-            case CardPlayFinishedEntry cardPlayFinished:
-                AddDetail(details, "card_id", cardPlayFinished.CardPlay.Card.Id.Entry);
-                if (NetCombatCardDb.Instance.TryGetCardId(cardPlayFinished.CardPlay.Card, out uint cardId2))
-                {
-                    AddDetail(details, "combat_card_index", cardId2);
-                }
-                AddDetail(details, "target_combat_id", cardPlayFinished.CardPlay.Target?.CombatId);
-                AddDetail(details, "target_model_id", cardPlayFinished.CardPlay.Target?.ModelId.Entry);
-                AddDetail(details, "result_pile", cardPlayFinished.CardPlay.ResultPile);
-                AddDetail(details, "is_auto_play", cardPlayFinished.CardPlay.IsAutoPlay);
-                AddDetail(details, "play_index", cardPlayFinished.CardPlay.PlayIndex);
-                AddDetail(details, "play_count", cardPlayFinished.CardPlay.PlayCount);
-                AddDetail(details, "was_ethereal", cardPlayFinished.WasEthereal);
-                try
-                {
-                    AddDetail(details, "energy_cost", cardPlayFinished.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
-                    AddDetail(details, "star_cost", cardPlayFinished.CardPlay.Card.GetStarCostWithModifiers());
-                }
-                catch
-                {
-                    // Ignore transient card state.
-                }
-                break;
-            case DamageReceivedEntry damageReceived:
-                AddDetail(details, "receiver_combat_id", damageReceived.Receiver.CombatId);
-                AddDetail(details, "receiver_model_id", damageReceived.Receiver.ModelId.Entry);
-                AddDetail(details, "dealer_combat_id", damageReceived.Dealer?.CombatId);
-                AddDetail(details, "dealer_model_id", damageReceived.Dealer?.ModelId.Entry);
-                AddDetail(details, "card_source_id", damageReceived.CardSource?.Id.Entry);
-                AddDetail(details, "blocked_damage", damageReceived.Result.BlockedDamage);
-                AddDetail(details, "unblocked_damage", damageReceived.Result.UnblockedDamage);
-                AddDetail(details, "overkill_damage", damageReceived.Result.OverkillDamage);
-                AddDetail(details, "was_fully_blocked", damageReceived.Result.WasFullyBlocked);
-                AddDetail(details, "was_target_killed", damageReceived.Result.WasTargetKilled);
-                break;
-            case BlockGainedEntry blockGained:
-                AddDetail(details, "receiver_combat_id", blockGained.Receiver.CombatId);
-                AddDetail(details, "receiver_model_id", blockGained.Receiver.ModelId.Entry);
-                AddDetail(details, "amount", blockGained.Amount);
-                AddDetail(details, "value_props", blockGained.Props);
-                AddDetail(details, "card_id", blockGained.CardPlay?.Card.Id.Entry);
-                break;
-            case EnergySpentEntry energySpent:
-                AddDetail(details, "amount", energySpent.Amount);
-                break;
-            case StarsModifiedEntry starsModified:
-                AddDetail(details, "amount", starsModified.Amount);
-                break;
-            case SummonedEntry summoned:
-                AddDetail(details, "amount", summoned.Amount);
-                break;
-            case CardDrawnEntry cardDrawn:
-                AddDetail(details, "card_id", cardDrawn.Card.Id.Entry);
-                AddDetail(details, "from_hand_draw", cardDrawn.FromHandDraw);
-                break;
-            case CardDiscardedEntry cardDiscarded:
-                AddDetail(details, "card_id", cardDiscarded.Card.Id.Entry);
-                break;
-            case CardExhaustedEntry cardExhausted:
-                AddDetail(details, "card_id", cardExhausted.Card.Id.Entry);
-                break;
-            case CardGeneratedEntry cardGenerated:
-                AddDetail(details, "card_id", cardGenerated.Card.Id.Entry);
-                AddDetail(details, "generated_by_player", cardGenerated.GeneratedByPlayer);
-                break;
-            case CardAfflictedEntry cardAfflicted:
-                AddDetail(details, "card_id", cardAfflicted.Card.Id.Entry);
-                AddDetail(details, "affliction_id", cardAfflicted.Affliction.Id.Entry);
-                break;
-            case CreatureAttackedEntry creatureAttacked:
-                AddDetail(details, "damage_results", creatureAttacked.DamageResults.Count);
-                AddDetail(details, "total_damage", creatureAttacked.DamageResults.Sum(static d => d.TotalDamage));
-                AddDetail(details, "targets", string.Join(",", creatureAttacked.DamageResults.Select(static d => d.Receiver.ModelId.Entry)));
-                break;
-            case MonsterPerformedMoveEntry monsterMove:
-                AddDetail(details, "monster_id", monsterMove.Monster.Id.Entry);
-                AddDetail(details, "move_id", monsterMove.Move.Id);
-                AddDetail(details, "targets", monsterMove.Targets == null ? null : string.Join(",", monsterMove.Targets.Select(static t => t.ModelId.Entry)));
-                break;
-            case PotionUsedEntry potionUsed:
-                AddDetail(details, "potion_id", potionUsed.Potion.Id.Entry);
-                AddDetail(details, "target_combat_id", potionUsed.Target?.CombatId);
-                AddDetail(details, "target_model_id", potionUsed.Target?.ModelId.Entry);
-                break;
-            case PowerReceivedEntry powerReceived:
-                AddDetail(details, "power_id", powerReceived.Power.Id.Entry);
-                AddDetail(details, "amount", powerReceived.Amount);
-                AddDetail(details, "applier_combat_id", powerReceived.Applier?.CombatId);
-                AddDetail(details, "applier_model_id", powerReceived.Applier?.ModelId.Entry);
-                break;
-            case OrbChanneledEntry orbChanneled:
-                AddDetail(details, "orb_id", orbChanneled.Orb.Id.Entry);
-                break;
+            switch (entry)
+            {
+                case CardPlayStartedEntry cardPlayStarted:
+                    AddDetail(details, "card_id", cardPlayStarted.CardPlay.Card.Id.Entry);
+                    if (NetCombatCardDb.Instance.TryGetCardId(cardPlayStarted.CardPlay.Card, out uint cardId1))
+                    {
+                        AddDetail(details, "combat_card_index", cardId1);
+                    }
+                    try
+                    {
+                        AddDetail(details, "energy_cost", cardPlayStarted.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
+                        AddDetail(details, "star_cost", cardPlayStarted.CardPlay.Card.GetStarCostWithModifiers());
+                    }
+                    catch
+                    {
+                        // Ignore transient card state.
+                    }
+                    AddDetail(details, "target_combat_id", cardPlayStarted.CardPlay.Target?.CombatId);
+                    AddDetail(details, "target_model_id", cardPlayStarted.CardPlay.Target?.ModelId.Entry);
+                    break;
+                case CardPlayFinishedEntry cardPlayFinished:
+                    AddDetail(details, "card_id", cardPlayFinished.CardPlay.Card.Id.Entry);
+                    if (NetCombatCardDb.Instance.TryGetCardId(cardPlayFinished.CardPlay.Card, out uint cardId2))
+                    {
+                        AddDetail(details, "combat_card_index", cardId2);
+                    }
+                    AddDetail(details, "target_combat_id", cardPlayFinished.CardPlay.Target?.CombatId);
+                    AddDetail(details, "target_model_id", cardPlayFinished.CardPlay.Target?.ModelId.Entry);
+                    AddDetail(details, "result_pile", cardPlayFinished.CardPlay.ResultPile);
+                    AddDetail(details, "is_auto_play", cardPlayFinished.CardPlay.IsAutoPlay);
+                    AddDetail(details, "play_index", cardPlayFinished.CardPlay.PlayIndex);
+                    AddDetail(details, "play_count", cardPlayFinished.CardPlay.PlayCount);
+                    AddDetail(details, "was_ethereal", cardPlayFinished.WasEthereal);
+                    try
+                    {
+                        AddDetail(details, "energy_cost", cardPlayFinished.CardPlay.Card.EnergyCost.GetWithModifiers(CostModifiers.All));
+                        AddDetail(details, "star_cost", cardPlayFinished.CardPlay.Card.GetStarCostWithModifiers());
+                    }
+                    catch
+                    {
+                        // Ignore transient card state.
+                    }
+                    break;
+                case DamageReceivedEntry damageReceived:
+                    AddDetail(details, "receiver_combat_id", damageReceived.Receiver.CombatId);
+                    AddDetail(details, "receiver_model_id", damageReceived.Receiver.ModelId.Entry);
+                    AddDetail(details, "dealer_combat_id", damageReceived.Dealer?.CombatId);
+                    AddDetail(details, "dealer_model_id", damageReceived.Dealer?.ModelId.Entry);
+                    AddDetail(details, "card_source_id", damageReceived.CardSource?.Id.Entry);
+                    AddDetail(details, "blocked_damage", damageReceived.Result.BlockedDamage);
+                    AddDetail(details, "unblocked_damage", damageReceived.Result.UnblockedDamage);
+                    AddDetail(details, "overkill_damage", damageReceived.Result.OverkillDamage);
+                    AddDetail(details, "was_fully_blocked", damageReceived.Result.WasFullyBlocked);
+                    AddDetail(details, "was_target_killed", damageReceived.Result.WasTargetKilled);
+                    break;
+                case BlockGainedEntry blockGained:
+                    AddDetail(details, "receiver_combat_id", blockGained.Receiver.CombatId);
+                    AddDetail(details, "receiver_model_id", blockGained.Receiver.ModelId.Entry);
+                    AddDetail(details, "amount", blockGained.Amount);
+                    AddDetail(details, "value_props", blockGained.Props);
+                    AddDetail(details, "card_id", blockGained.CardPlay?.Card.Id.Entry);
+                    break;
+                case EnergySpentEntry energySpent:
+                    AddDetail(details, "amount", energySpent.Amount);
+                    break;
+                case StarsModifiedEntry starsModified:
+                    AddDetail(details, "amount", starsModified.Amount);
+                    break;
+                case SummonedEntry summoned:
+                    AddDetail(details, "amount", summoned.Amount);
+                    break;
+                case CardDrawnEntry cardDrawn:
+                    AddDetail(details, "card_id", cardDrawn.Card.Id.Entry);
+                    AddDetail(details, "from_hand_draw", cardDrawn.FromHandDraw);
+                    break;
+                case CardDiscardedEntry cardDiscarded:
+                    AddDetail(details, "card_id", cardDiscarded.Card.Id.Entry);
+                    break;
+                case CardExhaustedEntry cardExhausted:
+                    AddDetail(details, "card_id", cardExhausted.Card.Id.Entry);
+                    break;
+                case CardGeneratedEntry cardGenerated:
+                    AddDetail(details, "card_id", cardGenerated.Card.Id.Entry);
+                    AddDetail(details, "generated_by_player", cardGenerated.GeneratedByPlayer);
+                    break;
+                case CardAfflictedEntry cardAfflicted:
+                    AddDetail(details, "card_id", cardAfflicted.Card.Id.Entry);
+                    AddDetail(details, "affliction_id", cardAfflicted.Affliction.Id.Entry);
+                    break;
+                case CreatureAttackedEntry creatureAttacked:
+                    AddDetail(details, "damage_results", creatureAttacked.DamageResults.Count);
+                    AddDetail(details, "total_damage", creatureAttacked.DamageResults.Sum(static d => d.TotalDamage));
+                    AddDetail(details, "targets", string.Join(",", creatureAttacked.DamageResults.Select(static d => d.Receiver.ModelId.Entry)));
+                    break;
+                case MonsterPerformedMoveEntry monsterMove:
+                    AddDetail(details, "monster_id", monsterMove.Monster.Id.Entry);
+                    AddDetail(details, "move_id", monsterMove.Move.Id);
+                    AddDetail(details, "targets", monsterMove.Targets == null ? null : string.Join(",", monsterMove.Targets.Select(static t => t.ModelId.Entry)));
+                    break;
+                case PotionUsedEntry potionUsed:
+                    AddDetail(details, "potion_id", potionUsed.Potion.Id.Entry);
+                    AddDetail(details, "target_combat_id", potionUsed.Target?.CombatId);
+                    AddDetail(details, "target_model_id", potionUsed.Target?.ModelId.Entry);
+                    break;
+                case PowerReceivedEntry powerReceived:
+                    AddDetail(details, "power_id", powerReceived.Power.Id.Entry);
+                    AddDetail(details, "amount", powerReceived.Amount);
+                    AddDetail(details, "applier_combat_id", powerReceived.Applier?.CombatId);
+                    AddDetail(details, "applier_model_id", powerReceived.Applier?.ModelId.Entry);
+                    break;
+                case OrbChanneledEntry orbChanneled:
+                    AddDetail(details, "orb_id", orbChanneled.Orb.Id.Entry);
+                    break;
+            }
+        }
+        catch (Exception detailEx)
+        {
+            AddDetail(details, "detail_error", detailEx.GetType().Name + ": " + detailEx.Message);
         }
 
         return snapshot;
+    }
+
+    private static CombatHistoryEntrySnapshot BuildCombatHistoryEntryErrorSnapshot(CombatHistoryEntry entry, int index, Exception ex)
+    {
+        return new CombatHistoryEntrySnapshot
+        {
+            Index = index,
+            EntryType = entry.GetType().Name,
+            RoundNumber = entry.RoundNumber,
+            CurrentSide = entry.CurrentSide.ToString(),
+            Description = "history_entry_error",
+            HumanReadable = ex.GetType().Name + ": " + ex.Message,
+            Details = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["error"] = ex.ToString()
+            }
+        };
     }
 
     private static void AddDetail(IDictionary<string, string?> details, string key, object? value)
@@ -1744,6 +1818,8 @@ public static class ProbeModEntry
     }
 
     private static OverlayPayload BuildOverlayPayload(
+        CombatState state,
+        IReadOnlyList<CombatHistoryEntry> historyEntries,
         Player? localPlayer,
         AnalyticsSnapshot analytics,
         RoutePlanSnapshot routePlan,
@@ -1763,8 +1839,102 @@ public static class ProbeModEntry
             TotalPanel = totalText,
             RoutePanel = routeText,
             LogsPanel = logsText,
+            CombatBoardScope = analytics.IsInCombat ? "当前战斗" : "最近一场",
+            CombatDamageBoard = BuildOverlayDamageBoard(state, historyEntries, localPlayer),
             Alerts = BuildDashboardAlerts(analytics)
         };
+    }
+
+    private static List<OverlayDamageEntry> BuildOverlayDamageBoard(
+        CombatState state,
+        IReadOnlyList<CombatHistoryEntry> historyEntries,
+        Player? localPlayer)
+    {
+        Dictionary<uint, int> damageByDealer = new();
+        foreach (CombatHistoryEntry entry in historyEntries)
+        {
+            if (entry is not DamageReceivedEntry damageReceived)
+            {
+                continue;
+            }
+
+            Creature? dealer = damageReceived.Dealer;
+            if (dealer == null)
+            {
+                continue;
+            }
+
+            if (!string.Equals(dealer.Side.ToString(), "Player", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            int dealt = Math.Max(0, damageReceived.Result.UnblockedDamage + damageReceived.Result.BlockedDamage);
+            if (dealt <= 0)
+            {
+                continue;
+            }
+
+            uint? dealerId = dealer.CombatId;
+            if (!dealerId.HasValue)
+            {
+                continue;
+            }
+
+            damageByDealer.TryGetValue(dealerId.Value, out int oldValue);
+            damageByDealer[dealerId.Value] = oldValue + dealt;
+        }
+
+        uint? localCombatId = localPlayer?.Creature?.CombatId;
+        List<OverlayDamageEntry> rows = new();
+        HashSet<uint> seen = new();
+        foreach (Player player in state.Players)
+        {
+            uint? combatId = player.Creature.CombatId;
+            if (!combatId.HasValue)
+            {
+                continue;
+            }
+
+            seen.Add(combatId.Value);
+            damageByDealer.TryGetValue(combatId.Value, out int dmg);
+            rows.Add(new OverlayDamageEntry
+            {
+                Name = string.IsNullOrWhiteSpace(player.Creature.Name)
+                    ? "玩家#" + player.NetId.ToString(CultureInfo.InvariantCulture)
+                    : player.Creature.Name,
+                Damage = dmg,
+                IsLocalPlayer = localCombatId.HasValue && localCombatId.Value == combatId.Value
+            });
+        }
+
+        foreach ((uint dealerId, int dmg) in damageByDealer)
+        {
+            if (seen.Contains(dealerId))
+            {
+                continue;
+            }
+
+            rows.Add(new OverlayDamageEntry
+            {
+                Name = "玩家#" + dealerId.ToString(CultureInfo.InvariantCulture),
+                Damage = dmg,
+                IsLocalPlayer = localCombatId.HasValue && localCombatId.Value == dealerId
+            });
+        }
+
+        rows = rows
+            .OrderByDescending(static r => r.Damage)
+            .ThenBy(static r => r.Name, StringComparer.Ordinal)
+            .ToList();
+
+        int total = rows.Sum(static r => r.Damage);
+        foreach (OverlayDamageEntry row in rows)
+        {
+            row.Ratio = total <= 0 ? 0 : Math.Clamp((double)row.Damage / total, 0, 1);
+        }
+
+        return rows;
     }
 
     private static string BuildOverlayCombatText(Player? localPlayer, AnalyticsSnapshot analytics)
@@ -2442,12 +2612,40 @@ public static class ProbeModEntry
             lock (FileLock)
             {
                 File.AppendAllText(ProbeLogPath, line);
+                if (!string.Equals(ProbeLogPath, ModsProbeLogPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    File.AppendAllText(ModsProbeLogPath, line);
+                }
             }
         }
         catch
         {
             // Ignore file log failures.
         }
+    }
+
+    private static string ResolveModsProbeLogPath()
+    {
+        try
+        {
+            string? processPath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(processPath))
+            {
+                string? gameDir = Path.GetDirectoryName(processPath);
+                if (!string.IsNullOrWhiteSpace(gameDir))
+                {
+                    string modDir = Path.Combine(gameDir, "mods", "Sts2Mcp");
+                    Directory.CreateDirectory(modDir);
+                    return Path.Combine(modDir, "probe_mod.log");
+                }
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        return Path.Combine(WorkDir, "probe_mod.log");
     }
 
     private sealed class Snapshot

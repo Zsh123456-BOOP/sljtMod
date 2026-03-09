@@ -6,7 +6,7 @@ Sts2Mcp one-click installer (Windows)
 2) Installer will:
    - Detect Steam directory
    - Detect Slay the Spire 2 directory via appmanifest_2868840.acf
-   - Backup existing mods\Sts2Mcp to Sts2Mcp.backup.<timestamp>
+   - Replace existing mods\Sts2Mcp directly (no backup)
    - Copy Sts2Mcp.dll and Sts2Mcp.pck
    - If game process is running, prompt whether to auto-close it (Y/N)
 
@@ -18,9 +18,6 @@ Auto-close game process without prompt:
 
 4) Uninstall:
    Uninstall-Sts2Mcp.bat
-
-5) Uninstall and restore latest backup:
-   Uninstall-Sts2Mcp.bat -RestoreLatestBackup
 
 Uninstall with auto-close game process:
    Uninstall-Sts2Mcp.bat -AutoCloseGame
