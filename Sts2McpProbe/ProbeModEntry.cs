@@ -391,6 +391,7 @@ public static class ProbeModEntry
             AnalyticsSnapshot analytics = UpdateAnalytics(state, localPlayerEntity, historyEntries, combatHistory);
             RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(state, localPlayerEntity);
             DashboardSnapshot dashboard = BuildDashboardSnapshot(state, localPlayerEntity, analytics, routePlan, combatHistory);
+            OverlayPayload overlayPayload = BuildOverlayPayload(localPlayerEntity, analytics, routePlan, combatHistory);
 
             Snapshot payload = new()
             {
@@ -421,6 +422,8 @@ public static class ProbeModEntry
                 File.WriteAllText(AnalyticsFilePath, analyticsJson);
                 File.WriteAllText(DashboardFilePath, dashboardJson);
             }
+
+            ProbeOverlayManager.Update(overlayPayload);
         }
         catch (Exception ex)
         {
@@ -1721,6 +1724,166 @@ public static class ProbeModEntry
         }
 
         return insights;
+    }
+
+    private static OverlayPayload BuildOverlayPayload(
+        Player? localPlayer,
+        AnalyticsSnapshot analytics,
+        RoutePlanSnapshot routePlan,
+        CombatHistorySnapshot combatHistory)
+    {
+        string combatText = BuildOverlayCombatText(localPlayer, analytics);
+        string totalText = BuildOverlayTotalText(analytics);
+        string routeText = BuildOverlayRouteText(routePlan);
+        string logsText = BuildOverlayLogsText(combatHistory);
+        return new OverlayPayload
+        {
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = analytics.Mode,
+            IsInCombat = analytics.IsInCombat,
+            Summary = BuildDashboardSummary(analytics, localPlayer),
+            CombatPanel = combatText,
+            TotalPanel = totalText,
+            RoutePanel = routeText,
+            LogsPanel = logsText,
+            Alerts = BuildDashboardAlerts(analytics)
+        };
+    }
+
+    private static string BuildOverlayCombatText(Player? localPlayer, AnalyticsSnapshot analytics)
+    {
+        int hp = localPlayer?.Creature.CurrentHp ?? 0;
+        int maxHp = localPlayer?.Creature.MaxHp ?? 0;
+        int block = localPlayer?.Creature.Block ?? 0;
+        int energy = localPlayer?.PlayerCombatState?.Energy ?? 0;
+        CombatMetricsSnapshot m = analytics.CurrentCombat;
+        List<string> lines = new()
+        {
+            $"状态: {(analytics.IsInCombat ? "战斗中" : "非战斗")} | 模式: {analytics.Mode}",
+            $"HP {hp}/{maxHp} | 格挡 {block} | 能量 {energy}",
+            $"来伤估计 {analytics.Highlights.IncomingDamageEstimate} | 未格挡威胁 {analytics.Highlights.UnblockedThreatEstimate}",
+            $"伤害 {m.DamageDealt} | 受伤 {m.DamageTaken} | 挡下 {m.DamageBlocked} | 过量 {m.OverkillDamage}",
+            $"打牌 {m.CardsPlayed} | 能量消耗 {m.EnergySpent} | 伤害效率 {m.DamagePerEnergy:F2} / 能量",
+            $"Buff {m.BuffsApplied} | Debuff {m.DebuffsApplied} | 节奏分 {m.TempoScore}"
+        };
+
+        CardMetricSnapshot? top = m.TopCards.FirstOrDefault();
+        if (top != null)
+        {
+            lines.Add($"本战 MVP: {top.CardId} (次数 {top.Played}, DPE {top.DamagePerEnergy:F2})");
+        }
+
+        List<string> alerts = BuildDashboardAlerts(analytics);
+        if (alerts.Count > 0)
+        {
+            lines.Add("");
+            lines.Add("提醒:");
+            lines.AddRange(alerts.Take(3).Select(static alert => "- " + alert));
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string BuildOverlayTotalText(AnalyticsSnapshot analytics)
+    {
+        CombatMetricsSnapshot total = analytics.Total;
+        CombatMetricsSnapshot single = analytics.Singleplayer.Total;
+        CombatMetricsSnapshot multi = analytics.Multiplayer.Total;
+        List<string> lines = new()
+        {
+            "总计",
+            $"伤害 {total.DamageDealt} | 受伤 {total.DamageTaken} | 挡下 {total.DamageBlocked}",
+            $"格挡获得 {total.BlockGained} | 能量消耗 {total.EnergySpent} | 过量伤害 {total.OverkillDamage}",
+            $"打牌 {total.CardsPlayed} | 总伤害效率 {total.DamagePerEnergy:F2}",
+            "",
+            "单机累计",
+            $"战斗样本 {analytics.Singleplayer.RecentBattles.Count} (近期) | 伤害效率 {single.DamagePerEnergy:F2}",
+            "",
+            "联机累计",
+            $"战斗样本 {analytics.Multiplayer.RecentBattles.Count} (近期) | 伤害效率 {multi.DamagePerEnergy:F2}"
+        };
+
+        if (total.TopCards.Count > 0)
+        {
+            lines.Add("");
+            lines.Add("使用率 Top 5:");
+            foreach (CardMetricSnapshot card in total.TopCards.Take(5))
+            {
+                lines.Add(
+                    $"- {card.CardId}: {card.Played} 次, 占比 {(card.UsageRate * 100):F1}%, DPE {card.DamagePerEnergy:F2}");
+            }
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string BuildOverlayRouteText(RoutePlanSnapshot routePlan)
+    {
+        List<string> lines = new()
+        {
+            $"路线策略: {routePlan.Strategy}",
+            $"当前层数: {routePlan.CurrentFloor} | 血线比: {(routePlan.HpRatio * 100):F1}%"
+        };
+
+        if (!routePlan.HasMapContext)
+        {
+            lines.Add("当前无地图分叉可评估。");
+            return string.Join(Environment.NewLine, lines);
+        }
+
+        if (routePlan.Suggested != null)
+        {
+            RouteOptionSnapshot s = routePlan.Suggested;
+            lines.Add(
+                $"建议: ({s.Coord.Row},{s.Coord.Col}) {s.PointType} | 分数 {s.Score:F2} | 风险 {s.RiskTag}");
+            if (s.PathPreview.Count > 0)
+            {
+                lines.Add("预览: " + string.Join(" -> ", s.PathPreview.Take(5)));
+            }
+
+            foreach (string reason in s.Reasons.Take(3))
+            {
+                lines.Add("- " + reason);
+            }
+        }
+
+        if (routePlan.Options.Count > 1)
+        {
+            lines.Add("");
+            lines.Add("备选:");
+            foreach (RouteOptionSnapshot option in routePlan.Options.Skip(1).Take(3))
+            {
+                lines.Add(
+                    $"- ({option.Coord.Row},{option.Coord.Col}) {option.PointType} | {option.Score:F2} | {option.RiskTag}");
+            }
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string BuildOverlayLogsText(CombatHistorySnapshot combatHistory)
+    {
+        List<string> lines = new()
+        {
+            $"战斗日志 (总 {combatHistory.TotalEntries}, 显示最近 16 条)"
+        };
+
+        foreach (CombatHistoryEntrySnapshot entry in combatHistory.RecentEntries.TakeLast(16))
+        {
+            string detail = string.Join(
+                ", ",
+                entry.Details.Take(2).Select(static pair => pair.Key + "=" + pair.Value));
+            if (string.IsNullOrEmpty(detail))
+            {
+                lines.Add($"#{entry.Index} [{entry.EntryType}] {entry.ActorName}");
+            }
+            else
+            {
+                lines.Add($"#{entry.Index} [{entry.EntryType}] {entry.ActorName} | {detail}");
+            }
+        }
+
+        return string.Join(Environment.NewLine, lines);
     }
 
     private static RoutePlanSnapshot BuildRoutePlanSnapshot(CombatState state, Player? localPlayer)
