@@ -155,7 +155,13 @@
 
 `..\Sts2DecisionEngine\README.md`
 
-## 11) 一键打包与一键安装（Windows）
+## 11) 桌宠接口文档
+
+给外部桌宠/Codex 的对接规范见：
+
+`DESKTOP_PET_API.md`
+
+## 12) 一键打包与一键安装（Windows）
 
 ### 开发者打包（发给别人）
 
@@ -181,17 +187,28 @@
 
 `Install-Sts2Mcp.bat`
 
+说明：
+- 源码仓库中的安装脚本路径：`ModDev\Sts2McpProbe\installer\Install-Sts2Mcp.bat`
+- 打包产物中的安装脚本路径：`ModDev\Sts2McpProbe\dist\Sts2McpInstaller\Install-Sts2Mcp.bat`
+
 安装器会自动：
 - 检测 Steam 目录（注册表 + 常见默认路径）
 - 读取 `libraryfolders.vdf`
 - 读取 `appmanifest_2868840.acf` 定位 STS2 目录
 - 自动备份旧 `mods\Sts2Mcp`
 - 安装 `Sts2Mcp.dll` 与 `Sts2Mcp.pck`
+- 若检测到游戏进程在运行，会提示是否自动关闭后继续（Y/N）
 
 手动指定游戏路径示例：
 
 ```bat
 Install-Sts2Mcp.bat "D:\SteamLibrary\steamapps\common\Slay the Spire 2"
+```
+
+无交互自动关闭游戏进程并安装：
+
+```bat
+Install-Sts2Mcp.bat -AutoCloseGame
 ```
 
 ### 卸载
@@ -204,4 +221,10 @@ Uninstall-Sts2Mcp.bat
 
 ```bat
 Uninstall-Sts2Mcp.bat -RestoreLatestBackup
+```
+
+无交互自动关闭游戏进程并卸载：
+
+```bat
+Uninstall-Sts2Mcp.bat -AutoCloseGame
 ```

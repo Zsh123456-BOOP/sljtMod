@@ -59,7 +59,12 @@ function Get-SteamRootCandidates {
         }
 
         foreach ($propName in @("SteamPath", "InstallPath")) {
-            $value = $item.$propName
+            $prop = $item.PSObject.Properties[$propName]
+            if (-not $prop) {
+                continue
+            }
+
+            $value = $prop.Value
             $normalized = Normalize-PathCandidate $value
             if ($normalized) {
                 $candidates.Add($normalized)
@@ -178,8 +183,68 @@ function Resolve-Sts2GamePath {
 }
 
 function Assert-GameNotRunning {
-    $running = Get-Process -Name "SlayTheSpire2" -ErrorAction SilentlyContinue
-    if ($running) {
-        throw "SlayTheSpire2 is running. Please close the game before install/uninstall."
+    param(
+        [switch]$AutoClose
+    )
+
+    $running = @(Get-Process -Name "SlayTheSpire2" -ErrorAction SilentlyContinue)
+    if ($running.Count -le 0) {
+        return
+    }
+
+    function Stop-RunningGame {
+        param(
+            [Parameter(Mandatory = $true)]
+            [System.Diagnostics.Process[]]$Processes
+        )
+
+        $pids = ($Processes | Select-Object -ExpandProperty Id) -join ", "
+        Write-Host ("[Sts2Mcp] Closing SlayTheSpire2 process (PID: {0})..." -f $pids)
+        try {
+            $Processes | Stop-Process -Force -ErrorAction Stop
+        } catch {
+            throw "Failed to close SlayTheSpire2 automatically. Please close it manually and retry."
+        }
+
+        Start-Sleep -Milliseconds 350
+        $stillRunning = Get-Process -Name "SlayTheSpire2" -ErrorAction SilentlyContinue
+        if ($stillRunning) {
+            throw "SlayTheSpire2 is still running after auto-close attempt. Please close it manually and retry."
+        }
+    }
+
+    $runningPids = ($running | Select-Object -ExpandProperty Id) -join ", "
+    Write-Host ("[Sts2Mcp] Detected running process: SlayTheSpire2 (PID: {0})" -f $runningPids)
+
+    if ($AutoClose) {
+        Stop-RunningGame -Processes $running
+        return
+    }
+
+    while ($true) {
+        $answer = Read-Host "[Sts2Mcp] Game is running. Auto-close and continue? (Y/N)"
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            continue
+        }
+
+        switch ($answer.Trim().ToLowerInvariant()) {
+            "y" {
+                Stop-RunningGame -Processes $running
+                return
+            }
+            "yes" {
+                Stop-RunningGame -Processes $running
+                return
+            }
+            "n" {
+                throw "SlayTheSpire2 is running. Installation/uninstallation canceled by user."
+            }
+            "no" {
+                throw "SlayTheSpire2 is running. Installation/uninstallation canceled by user."
+            }
+            default {
+                Write-Host "[Sts2Mcp] Please type Y or N."
+            }
+        }
     }
 }

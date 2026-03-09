@@ -1,6 +1,7 @@
 param(
     [string]$GamePath,
-    [switch]$RestoreLatestBackup
+    [switch]$RestoreLatestBackup,
+    [switch]$AutoCloseGame
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,7 +9,7 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot "InstallerCommon.ps1")
 
-Assert-GameNotRunning
+Assert-GameNotRunning -AutoClose:$AutoCloseGame
 
 $resolvedGamePath = Resolve-Sts2GamePath -PreferredPath $GamePath
 if (-not $resolvedGamePath) {
