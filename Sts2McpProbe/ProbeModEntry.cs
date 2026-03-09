@@ -390,6 +390,7 @@ public static class ProbeModEntry
             CombatHistorySnapshot combatHistory = BuildCombatHistorySnapshot(state, historyEntries);
             AnalyticsSnapshot analytics = UpdateAnalytics(state, localPlayerEntity, historyEntries, combatHistory);
             RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(state, localPlayerEntity);
+            analytics.RouteHistory = routePlan.HistoricalStats;
             DashboardSnapshot dashboard = BuildDashboardSnapshot(state, localPlayerEntity, analytics, routePlan, combatHistory);
             OverlayPayload overlayPayload = BuildOverlayPayload(localPlayerEntity, analytics, routePlan, combatHistory);
 
@@ -1640,6 +1641,7 @@ public static class ProbeModEntry
         RoutePlanSnapshot routePlan,
         CombatHistorySnapshot combatHistory)
     {
+        List<string> funInsights = BuildFunInsights(state, analytics, combatHistory, routePlan);
         DashboardSnapshot dashboard = new()
         {
             ModId = ModId,
@@ -1653,9 +1655,10 @@ public static class ProbeModEntry
             RecentBattles = analytics.RecentBattles.Take(10).ToList(),
             RecentCombatLog = analytics.RecentCombatLog,
             RoutePlan = routePlan,
+            RouteHistory = routePlan.HistoricalStats,
             Summary = BuildDashboardSummary(analytics, localPlayer),
             Alerts = BuildDashboardAlerts(analytics),
-            FunInsights = BuildFunInsights(state, analytics, combatHistory)
+            FunInsights = funInsights
         };
 
         return dashboard;
@@ -1694,7 +1697,8 @@ public static class ProbeModEntry
     private static List<string> BuildFunInsights(
         CombatState state,
         AnalyticsSnapshot analytics,
-        CombatHistorySnapshot combatHistory)
+        CombatHistorySnapshot combatHistory,
+        RoutePlanSnapshot routePlan)
     {
         List<string> insights = new();
         CardMetricSnapshot? topCard = analytics.CurrentCombat.TopCards.FirstOrDefault();
@@ -1721,6 +1725,19 @@ public static class ProbeModEntry
         else
         {
             insights.Add("当前处于单机战斗统计通道。");
+        }
+
+        if (routePlan.HistoricalStats.TotalVisited > 0)
+        {
+            if (!string.IsNullOrEmpty(routePlan.HistoricalStats.MostVisitedLabel))
+            {
+                insights.Add($"路线最多节点类型：{routePlan.HistoricalStats.MostVisitedLabel}。");
+            }
+
+            if (!string.IsNullOrEmpty(routePlan.HistoricalStats.BestTypeLabel))
+            {
+                insights.Add($"路线收益最佳类型：{routePlan.HistoricalStats.BestTypeLabel}。");
+            }
         }
 
         return insights;
@@ -1825,6 +1842,36 @@ public static class ProbeModEntry
             $"当前层数: {routePlan.CurrentFloor} | 血线比: {(routePlan.HpRatio * 100):F1}%"
         };
 
+        RouteHistoryStatsSnapshot history = routePlan.HistoricalStats;
+        if (history.TotalVisited > 0)
+        {
+            lines.Add(
+                $"历史统计: 共 {history.TotalVisited} 节点 | 最多 {history.MostVisitedLabel ?? "N/A"} | 最优 {history.BestTypeLabel ?? "N/A"}");
+            if (!string.IsNullOrEmpty(history.WorstTypeLabel))
+            {
+                lines.Add($"最亏类型: {history.WorstTypeLabel} (评分 {history.WorstTypeValueScore:F2})");
+            }
+
+            if (history.ByType.Count > 0)
+            {
+                lines.Add("类型榜:");
+                foreach (RouteTypeStatSnapshot type in history.ByType.Take(5))
+                {
+                    lines.Add(
+                        $"- {type.Label}: {type.Visits} 次, 均伤 {type.AvgDamageTaken:F1}, 均回合 {type.AvgTurns:F1}, 评分 {type.AvgValueScore:F2}");
+                }
+            }
+
+            if (history.RecentPath.Count > 0)
+            {
+                lines.Add("最近路径: " + string.Join(" -> ", history.RecentPath.TakeLast(8)));
+            }
+        }
+        else
+        {
+            lines.Add("历史统计: 暂无足够路径数据。");
+        }
+
         if (!routePlan.HasMapContext)
         {
             lines.Add("当前无地图分叉可评估。");
@@ -1856,6 +1903,13 @@ public static class ProbeModEntry
                 lines.Add(
                     $"- ({option.Coord.Row},{option.Coord.Col}) {option.PointType} | {option.Score:F2} | {option.RiskTag}");
             }
+        }
+
+        if (routePlan.Insights.Count > 0)
+        {
+            lines.Add("");
+            lines.Add("路线建议:");
+            lines.AddRange(routePlan.Insights.Take(4).Select(static x => "- " + x));
         }
 
         return string.Join(Environment.NewLine, lines);
@@ -1904,8 +1958,10 @@ public static class ProbeModEntry
             HpRatio = Math.Round(hpRatio, 4),
             Strategy = BuildRouteStrategy(hpRatio, gold),
             HasMapContext = runState.CurrentMapPoint != null,
+            HistoricalStats = BuildRouteHistoryStats(runState, localPlayer),
             Options = new List<RouteOptionSnapshot>()
         };
+        snapshot.Insights = BuildRouteInsights(snapshot.HistoricalStats, hpRatio, gold);
 
         if (runState.CurrentMapPoint == null)
         {
@@ -1943,6 +1999,243 @@ public static class ProbeModEntry
             .ToList();
         snapshot.Suggested = snapshot.Options.FirstOrDefault();
         return snapshot;
+    }
+
+    private static RouteHistoryStatsSnapshot BuildRouteHistoryStats(IRunState runState, Player? localPlayer)
+    {
+        List<MapPointHistoryEntry> entries = runState.MapPointHistory
+            .SelectMany(static act => act)
+            .ToList();
+
+        RouteHistoryStatsSnapshot snapshot = new()
+        {
+            TotalVisited = entries.Count
+        };
+
+        if (entries.Count == 0)
+        {
+            return snapshot;
+        }
+
+        ulong? localNetId = localPlayer?.NetId;
+        Dictionary<string, RouteTypeAggregate> buckets = new(StringComparer.Ordinal);
+        List<string> recentPath = new();
+        foreach (MapPointHistoryEntry entry in entries)
+        {
+            string typeKey = NormalizeRouteTypeKey(entry.MapPointType.ToString());
+            recentPath.Add(typeKey);
+            if (!buckets.TryGetValue(typeKey, out RouteTypeAggregate? bucket))
+            {
+                bucket = new RouteTypeAggregate
+                {
+                    TypeKey = typeKey
+                };
+                buckets[typeKey] = bucket;
+            }
+
+            bucket.Visits += 1;
+            int turnsTaken = entry.Rooms.Sum(static room => Math.Max(0, room.TurnsTaken));
+            bucket.TotalTurns += turnsTaken;
+
+            if (localNetId.HasValue)
+            {
+                try
+                {
+                    PlayerMapPointHistoryEntry playerStats = entry.GetEntry(localNetId.Value);
+                    int damageTaken = Math.Max(0, playerStats.DamageTaken);
+                    int hpHealed = Math.Max(0, playerStats.HpHealed);
+                    int goldDelta = playerStats.GoldGained - playerStats.GoldSpent - playerStats.GoldLost;
+                    int lootCount = playerStats.CardsGained.Count
+                        + playerStats.CardChoices.Count
+                        + playerStats.RelicChoices.Count * 2
+                        + playerStats.PotionChoices.Count;
+
+                    bucket.TotalDamageTaken += damageTaken;
+                    bucket.TotalHpHealed += hpHealed;
+                    bucket.TotalGoldDelta += goldDelta;
+                    bucket.TotalLootCount += lootCount;
+                    bucket.TotalValueScore += EvaluateRouteNodeScore(
+                        damageTaken,
+                        hpHealed,
+                        goldDelta,
+                        lootCount,
+                        turnsTaken);
+                }
+                catch
+                {
+                    // Skip missing local player stats for this entry.
+                }
+            }
+        }
+
+        List<RouteTypeStatSnapshot> byType = buckets.Values
+            .Select(bucket =>
+            {
+                int visits = Math.Max(1, bucket.Visits);
+                return new RouteTypeStatSnapshot
+                {
+                    TypeKey = bucket.TypeKey,
+                    Label = RouteTypeKeyToLabel(bucket.TypeKey),
+                    Visits = bucket.Visits,
+                    VisitRate = Math.Round((double)bucket.Visits / entries.Count, 4),
+                    AvgTurns = Math.Round(SafeDivide(bucket.TotalTurns, visits), 3),
+                    AvgDamageTaken = Math.Round(SafeDivide(bucket.TotalDamageTaken, visits), 3),
+                    AvgHpHealed = Math.Round(SafeDivide(bucket.TotalHpHealed, visits), 3),
+                    AvgGoldDelta = Math.Round(SafeDivide(bucket.TotalGoldDelta, visits), 3),
+                    AvgValueScore = Math.Round(SafeDivide(bucket.TotalValueScore, visits), 3),
+                    TotalTurns = bucket.TotalTurns,
+                    TotalDamageTaken = bucket.TotalDamageTaken,
+                    TotalHpHealed = bucket.TotalHpHealed,
+                    TotalGoldDelta = bucket.TotalGoldDelta,
+                    TotalLootCount = bucket.TotalLootCount
+                };
+            })
+            .OrderByDescending(static item => item.Visits)
+            .ThenBy(static item => item.TypeKey, StringComparer.Ordinal)
+            .ToList();
+
+        snapshot.ByType = byType;
+        snapshot.RecentPath = recentPath
+            .TakeLast(16)
+            .Select(RouteTypeKeyToLabel)
+            .ToList();
+
+        RouteTypeStatSnapshot? mostVisited = byType
+            .OrderByDescending(static item => item.Visits)
+            .ThenByDescending(static item => item.AvgValueScore)
+            .FirstOrDefault();
+        RouteTypeStatSnapshot? bestType = byType
+            .OrderByDescending(static item => item.AvgValueScore)
+            .ThenByDescending(static item => item.Visits)
+            .FirstOrDefault();
+        RouteTypeStatSnapshot? worstType = byType
+            .OrderBy(static item => item.AvgValueScore)
+            .ThenByDescending(static item => item.Visits)
+            .FirstOrDefault();
+
+        snapshot.MostVisitedType = mostVisited?.TypeKey;
+        snapshot.MostVisitedLabel = mostVisited?.Label;
+        snapshot.BestType = bestType?.TypeKey;
+        snapshot.BestTypeLabel = bestType?.Label;
+        snapshot.WorstType = worstType?.TypeKey;
+        snapshot.WorstTypeLabel = worstType?.Label;
+        snapshot.BestTypeValueScore = bestType?.AvgValueScore ?? 0;
+        snapshot.WorstTypeValueScore = worstType?.AvgValueScore ?? 0;
+
+        return snapshot;
+    }
+
+    private static List<string> BuildRouteInsights(RouteHistoryStatsSnapshot stats, double hpRatio, int gold)
+    {
+        List<string> insights = new();
+        if (stats.TotalVisited <= 0)
+        {
+            insights.Add("尚无路线历史，先完成几层再做偏好判断。");
+            return insights;
+        }
+
+        if (!string.IsNullOrEmpty(stats.MostVisitedLabel))
+        {
+            insights.Add($"你目前走得最多的是【{stats.MostVisitedLabel}】。");
+        }
+
+        if (!string.IsNullOrEmpty(stats.BestTypeLabel))
+        {
+            insights.Add($"按历史收益评分，当前最优倾向是【{stats.BestTypeLabel}】。");
+        }
+
+        if (!string.IsNullOrEmpty(stats.WorstTypeLabel) &&
+            !string.Equals(stats.WorstTypeLabel, stats.BestTypeLabel, StringComparison.Ordinal))
+        {
+            insights.Add($"按历史收益评分，当前最亏的是【{stats.WorstTypeLabel}】。");
+        }
+
+        if (hpRatio < 0.45)
+        {
+            insights.Add("血线偏低，路线优先休息点/低风险问号。");
+        }
+        else if (gold >= 180)
+        {
+            insights.Add("金币充足，商店节点价值明显提升。");
+        }
+
+        return insights;
+    }
+
+    private static double EvaluateRouteNodeScore(
+        int damageTaken,
+        int hpHealed,
+        int goldDelta,
+        int lootCount,
+        int turnsTaken)
+    {
+        return hpHealed * 1.1
+            - damageTaken * 1.0
+            + goldDelta * 0.035
+            + lootCount * 0.45
+            - turnsTaken * 0.12;
+    }
+
+    private static string NormalizeRouteTypeKey(string pointType)
+    {
+        string lower = pointType.ToLowerInvariant();
+        if (lower.Contains("elite", StringComparison.Ordinal))
+        {
+            return "elite";
+        }
+
+        if (lower.Contains("question", StringComparison.Ordinal) ||
+            lower.Contains("event", StringComparison.Ordinal))
+        {
+            return "question";
+        }
+
+        if (lower.Contains("combat", StringComparison.Ordinal) ||
+            lower.Contains("monster", StringComparison.Ordinal) ||
+            lower.Contains("enemy", StringComparison.Ordinal))
+        {
+            return "monster";
+        }
+
+        if (lower.Contains("rest", StringComparison.Ordinal) ||
+            lower.Contains("camp", StringComparison.Ordinal))
+        {
+            return "rest";
+        }
+
+        if (lower.Contains("shop", StringComparison.Ordinal) ||
+            lower.Contains("merchant", StringComparison.Ordinal))
+        {
+            return "shop";
+        }
+
+        if (lower.Contains("treasure", StringComparison.Ordinal) ||
+            lower.Contains("chest", StringComparison.Ordinal))
+        {
+            return "treasure";
+        }
+
+        if (lower.Contains("boss", StringComparison.Ordinal))
+        {
+            return "boss";
+        }
+
+        return pointType.ToLowerInvariant();
+    }
+
+    private static string RouteTypeKeyToLabel(string routeTypeKey)
+    {
+        return routeTypeKey switch
+        {
+            "elite" => "精英",
+            "question" => "问号",
+            "monster" => "小怪",
+            "rest" => "休息",
+            "shop" => "商店",
+            "treasure" => "宝箱",
+            "boss" => "Boss",
+            _ => routeTypeKey
+        };
     }
 
     private static RouteEval EvaluateRoute(MapPoint point, int depth, double hpRatio, int gold)
@@ -2097,6 +2390,16 @@ public static class ProbeModEntry
         }
 
         return (double)numerator / denominator;
+    }
+
+    private static double SafeDivide(double numerator, int denominator)
+    {
+        if (denominator <= 0)
+        {
+            return 0;
+        }
+
+        return numerator / denominator;
     }
 
     private static void WriteStatus(string phase, string message)
@@ -2480,6 +2783,7 @@ public static class ProbeModEntry
         public List<BattleSegmentSnapshot> RecentBattles { get; set; } = new();
         public List<CombatLogLineSnapshot> RecentCombatLog { get; set; } = new();
         public AnalyticsHighlightsSnapshot Highlights { get; set; } = new();
+        public RouteHistoryStatsSnapshot RouteHistory { get; set; } = new();
     }
 
     private sealed class ModeMetricsSnapshot
@@ -2570,8 +2874,55 @@ public static class ProbeModEntry
         public bool HasMapContext { get; set; }
         public double HpRatio { get; set; }
         public string Strategy { get; set; } = "balanced";
+        public RouteHistoryStatsSnapshot HistoricalStats { get; set; } = new();
+        public List<string> Insights { get; set; } = new();
         public RouteOptionSnapshot? Suggested { get; set; }
         public List<RouteOptionSnapshot> Options { get; set; } = new();
+    }
+
+    private sealed class RouteHistoryStatsSnapshot
+    {
+        public int TotalVisited { get; set; }
+        public string? MostVisitedType { get; set; }
+        public string? MostVisitedLabel { get; set; }
+        public string? BestType { get; set; }
+        public string? BestTypeLabel { get; set; }
+        public string? WorstType { get; set; }
+        public string? WorstTypeLabel { get; set; }
+        public double BestTypeValueScore { get; set; }
+        public double WorstTypeValueScore { get; set; }
+        public List<RouteTypeStatSnapshot> ByType { get; set; } = new();
+        public List<string> RecentPath { get; set; } = new();
+    }
+
+    private sealed class RouteTypeStatSnapshot
+    {
+        public string TypeKey { get; set; } = string.Empty;
+        public string Label { get; set; } = string.Empty;
+        public int Visits { get; set; }
+        public double VisitRate { get; set; }
+        public double AvgTurns { get; set; }
+        public double AvgDamageTaken { get; set; }
+        public double AvgHpHealed { get; set; }
+        public double AvgGoldDelta { get; set; }
+        public double AvgValueScore { get; set; }
+        public int TotalTurns { get; set; }
+        public int TotalDamageTaken { get; set; }
+        public int TotalHpHealed { get; set; }
+        public int TotalGoldDelta { get; set; }
+        public int TotalLootCount { get; set; }
+    }
+
+    private sealed class RouteTypeAggregate
+    {
+        public string TypeKey { get; set; } = string.Empty;
+        public int Visits { get; set; }
+        public int TotalTurns { get; set; }
+        public int TotalDamageTaken { get; set; }
+        public int TotalHpHealed { get; set; }
+        public int TotalGoldDelta { get; set; }
+        public int TotalLootCount { get; set; }
+        public double TotalValueScore { get; set; }
     }
 
     private sealed class RouteOptionSnapshot
@@ -2598,6 +2949,7 @@ public static class ProbeModEntry
         public CombatMetricsSnapshot SingleplayerTotal { get; set; } = new();
         public CombatMetricsSnapshot MultiplayerTotal { get; set; } = new();
         public RoutePlanSnapshot RoutePlan { get; set; } = new();
+        public RouteHistoryStatsSnapshot RouteHistory { get; set; } = new();
         public List<BattleSegmentSnapshot> RecentBattles { get; set; } = new();
         public List<CombatLogLineSnapshot> RecentCombatLog { get; set; } = new();
     }
