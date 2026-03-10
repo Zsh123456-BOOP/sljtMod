@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -6,6 +7,7 @@ using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Combat.History;
 using MegaCrit.Sts2.Core.Combat.History.Entries;
 using MegaCrit.Sts2.Core.Context;
+using MegaCrit.Sts2.Core.Commands;
 using MegaCrit.Sts2.Core.Entities.Cards;
 using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Entities.Players;
@@ -18,6 +20,7 @@ using MegaCrit.Sts2.Core.MonsterMoves.Intents;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Runs.History;
+using MegaCrit.Sts2.Core.ValueProps;
 
 namespace Sts2Mcp;
 
@@ -33,13 +36,14 @@ public static class ProbeModEntry
     };
     private static readonly TimeSpan DumpInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan DictionaryRetryInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan RouteDebugInterval = TimeSpan.FromSeconds(1);
     private const int MaxHistoryEntries = 80;
     private const int MaxBattleSegments = 120;
     private const int MaxDashboardLogEntries = 30;
-    private const int RoutePlanDepth = 4;
     private static DateTime _lastDumpUtc = DateTime.MinValue;
     private static DateTime _lastCommandCheckUtc = DateTime.MinValue;
     private static DateTime _lastDictionaryAttemptUtc = DateTime.MinValue;
+    private static DateTime _lastRouteDebugUtc = DateTime.MinValue;
     private static bool _hooksInstalled;
     private static bool _dictionaryDumped;
     private static bool _wasInCombat;
@@ -53,6 +57,15 @@ public static class ProbeModEntry
     private static readonly List<BattleSegmentSnapshot> _battleSegments = new();
     private static BattleSegmentRuntime? _activeBattle;
     private static readonly Dictionary<string, string> _powerTypeCache = new(StringComparer.Ordinal);
+    private static readonly object ModifierCatalogLock = new();
+    private static readonly Dictionary<PowerSourceKey, PowerSourceRecord> _powerSourceTracker = new();
+    private static readonly Dictionary<uint, ContributionAccumulator> _combatContributions = new();
+    private static readonly Dictionary<ulong, ContributionAccumulator> _totalContributions = new();
+    private static readonly Dictionary<string, Dictionary<ulong, ContributionAccumulator>> _modeContributions = new(StringComparer.Ordinal)
+    {
+        ["singleplayer"] = new Dictionary<ulong, ContributionAccumulator>(),
+        ["multiplayer"] = new Dictionary<ulong, ContributionAccumulator>()
+    };
 
     private static readonly string WorkDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -65,6 +78,12 @@ public static class ProbeModEntry
     private static readonly string CommandFilePath = Path.Combine(WorkDir, "command.json");
     private static readonly string ProbeLogPath = Path.Combine(WorkDir, "probe.log");
     private static readonly string ModsProbeLogPath = ResolveModsProbeLogPath();
+    private static readonly FieldInfo? CombatTrackerStateField =
+        typeof(CombatStateTracker).GetField("_state", BindingFlags.Instance | BindingFlags.NonPublic);
+    private static readonly FieldInfo? RunManagerStateField =
+        typeof(RunManager).GetField("<State>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
+    private static List<OverlayModifierCatalogEntry>? _cardCatalogCache;
+    private static List<OverlayModifierCatalogEntry>? _relicCatalogCache;
 
     public static void Initialize()
     {
@@ -98,6 +117,10 @@ public static class ProbeModEntry
         CombatManager.Instance.CombatSetUp += OnCombatSetUp;
         CombatManager.Instance.CombatEnded += OnCombatEnded;
         CombatManager.Instance.StateTracker.CombatStateChanged += OnCombatStateChanged;
+        RunManager.Instance.RunStarted += OnRunStarted;
+        RunManager.Instance.ActEntered += OnActEntered;
+        RunManager.Instance.RoomEntered += OnRoomEntered;
+        RunManager.Instance.RoomExited += OnRoomExited;
         SafeLog("Hooks installed.");
     }
 
@@ -112,6 +135,7 @@ public static class ProbeModEntry
     {
         SafeLog("CombatEnded.");
         WriteStatus("combat_ended", "Combat ended.");
+        TryDumpFromTrackedState("combat_ended");
     }
 
     private static void OnCombatStateChanged(CombatState state)
@@ -130,6 +154,142 @@ public static class ProbeModEntry
             _lastCommandCheckUtc = utcNow;
             TryExecuteCommand(state);
         }
+    }
+
+    private static void OnRoomEntered()
+    {
+        SafeLog("RoomEntered.");
+        TryDumpFromTrackedState("room_entered");
+    }
+
+    private static void OnRoomExited()
+    {
+        SafeLog("RoomExited.");
+        TryDumpFromTrackedState("room_exited");
+    }
+
+    private static void OnRunStarted(RunState _)
+    {
+        SafeLog("RunStarted.");
+        TryDumpFromRunManager("run_started");
+    }
+
+    private static void OnActEntered()
+    {
+        SafeLog("ActEntered.");
+        TryDumpFromRunManager("act_entered");
+    }
+
+    private static void TryDumpFromTrackedState(string reason)
+    {
+        try
+        {
+            CombatStateTracker? tracker = CombatManager.Instance?.StateTracker;
+            if (tracker == null || CombatTrackerStateField == null)
+            {
+                SafeLog("TryDumpFromTrackedState skipped: tracker/field unavailable.");
+                return;
+            }
+
+            if (CombatTrackerStateField.GetValue(tracker) is not CombatState trackedState || trackedState.RunState == null)
+            {
+                SafeLog("TryDumpFromTrackedState skipped: no tracked state. fallback to RunManager state.");
+                TryDumpFromRunManager(reason + "_fallback");
+                return;
+            }
+
+            _lastDumpUtc = DateTime.UtcNow;
+            DumpState(trackedState, reason);
+        }
+        catch (Exception ex)
+        {
+            SafeLog("TryDumpFromTrackedState failed: " + ex.Message);
+        }
+    }
+
+    private static void TryDumpFromRunManager(string reason)
+    {
+        try
+        {
+            RunManager? runManager = RunManager.Instance;
+            if (runManager == null || RunManagerStateField == null)
+            {
+                SafeLog("TryDumpFromRunManager skipped: run manager/state field unavailable.");
+                return;
+            }
+
+            if (RunManagerStateField.GetValue(runManager) is not RunState runState)
+            {
+                SafeLog("TryDumpFromRunManager skipped: run state unavailable.");
+                return;
+            }
+
+            string modeKey = ResolveModeKeyFromRunManager(runManager);
+            Player? localPlayer = ResolveLocalPlayer(runState);
+            double hpRatio = 1;
+            if (localPlayer?.Creature != null && localPlayer.Creature.MaxHp > 0)
+            {
+                hpRatio = Math.Clamp((double)localPlayer.Creature.CurrentHp / localPlayer.Creature.MaxHp, 0, 1);
+            }
+
+            int gold = localPlayer?.Gold ?? 0;
+            RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(runState, localPlayer, modeKey, hpRatio, gold);
+            List<OverlayRouteOption> routeOptions = BuildOverlayRouteOptions(routePlan);
+            OverlayPayload payload = new()
+            {
+                TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                Mode = modeKey,
+                IsInCombat = false,
+                Summary = "非战斗阶段：路线分析已启用",
+                CombatPanel = "当前不在战斗，战斗详情将在进入战斗后刷新。",
+                TotalPanel = BuildOverlayTotalText(BuildFallbackAnalytics(modeKey)),
+                RoutePanel = BuildOverlayRouteText(routePlan),
+                LogsPanel = "当前无战斗日志。",
+                CombatBoardScope = "当前战斗",
+                CombatDamageBoard = new List<OverlayDamageEntry>(),
+                RouteLegendEntries = BuildOverlayRouteLegendEntries(routePlan),
+                RouteOptions = routeOptions,
+                SelectedRouteOptionIndex = -1,
+                ModifierState = BuildOverlayModifierState(localPlayer),
+                Alerts = routeOptions.Count == 0
+                    ? new List<string> { "当前地图阶段未识别到可选路线分叉。" }
+                    : new List<string>()
+            };
+
+            ProbeOverlayManager.Update(payload);
+            SafeLog(
+                "TryDumpFromRunManager ok: reason=" + reason
+                + " mode=" + modeKey
+                + " hasMap=" + (runState.Map != null)
+                + " currentMapPoint=" + (runState.CurrentMapPoint != null)
+                + " currentCoord=" + (runState.CurrentMapCoord.HasValue
+                    ? $"{runState.CurrentMapCoord.Value.row},{runState.CurrentMapCoord.Value.col}"
+                    : "null")
+                + " options=" + routePlan.Options.Count.ToString(CultureInfo.InvariantCulture));
+
+            if (routePlan.Options.Count > 0)
+            {
+                for (int i = 0; i < Math.Min(4, routePlan.Options.Count); i++)
+                {
+                    RouteOptionSnapshot opt = routePlan.Options[i];
+                    SafeLog(
+                        "RunRoute.Option[" + i.ToString(CultureInfo.InvariantCulture) + "] "
+                        + $"{opt.PointTypeLabel} score={opt.Score:F2} coords="
+                        + (opt.PathCoords.Count == 0
+                            ? "<empty>"
+                            : string.Join(" -> ", opt.PathCoords.Take(8).Select(static c => $"{c.Row},{c.Col}"))));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            SafeLog("TryDumpFromRunManager failed: " + ex.Message);
+        }
+    }
+
+    private static string ResolveModeKeyFromRunManager(RunManager runManager)
+    {
+        return runManager.IsSinglePlayerOrFakeMultiplayer ? "singleplayer" : "multiplayer";
     }
 
     private static void TryDumpDictionary(bool force)
@@ -403,6 +563,7 @@ public static class ProbeModEntry
             CombatHistorySnapshot combatHistory = BuildCombatHistorySnapshot(state, historyEntries);
             AnalyticsSnapshot analytics = UpdateAnalytics(state, localPlayerEntity, historyEntries, combatHistory);
             RoutePlanSnapshot routePlan = BuildRoutePlanSnapshot(state, localPlayerEntity);
+            TryLogRoutePlanDebug(state, runContext, routePlan);
             analytics.RouteHistory = routePlan.HistoricalStats;
             DashboardSnapshot dashboard = BuildDashboardSnapshot(state, localPlayerEntity, analytics, routePlan, combatHistory);
             OverlayPayload overlayPayload = BuildOverlayPayload(state, historyEntries, localPlayerEntity, analytics, routePlan, combatHistory);
@@ -651,6 +812,7 @@ public static class ProbeModEntry
     private static RunContextSnapshot BuildRunContextSnapshot(CombatState state, Player? localPlayer)
     {
         IRunState runState = state.RunState;
+        List<MapPoint> nextChoices = GetNextRouteChoices(runState);
         RunContextSnapshot snapshot = new()
         {
             IsRunInProgress = RunManager.Instance.IsInProgress,
@@ -669,6 +831,11 @@ public static class ProbeModEntry
             SeedValue = runState.Rng.Seed,
             CurrentMapCoord = BuildMapCoordSnapshot(runState.CurrentMapCoord),
             CurrentMapPointType = runState.CurrentMapPoint?.PointType.ToString(),
+            NextMapChoices = nextChoices
+                .OrderBy(static p => p.coord.row)
+                .ThenBy(static p => p.coord.col)
+                .Select(BuildMapPointChoiceSnapshot)
+                .ToList(),
             Modifiers = runState.Modifiers
                 .Select(static m => m.Id.Entry)
                 .OrderBy(static id => id, StringComparer.Ordinal)
@@ -684,15 +851,6 @@ public static class ProbeModEntry
                 RoomType = state.Encounter.RoomType.ToString(),
                 Slots = state.Encounter.Slots.ToList()
             };
-        }
-
-        if (runState.CurrentMapPoint != null)
-        {
-            snapshot.NextMapChoices = runState.CurrentMapPoint.Children
-                .OrderBy(static p => p.coord.row)
-                .ThenBy(static p => p.coord.col)
-                .Select(BuildMapPointChoiceSnapshot)
-                .ToList();
         }
 
         if (localPlayer != null)
@@ -744,6 +902,26 @@ public static class ProbeModEntry
         }
 
         return snapshot;
+    }
+
+    private static List<MapPoint> GetNextRouteChoices(IRunState runState)
+    {
+        if (runState.CurrentMapPoint != null)
+        {
+            return runState.CurrentMapPoint.Children
+                .Where(static c => c != null)
+                .ToList();
+        }
+
+        MapPoint? startingMapPoint = runState.Map?.StartingMapPoint;
+        if (startingMapPoint != null)
+        {
+            return startingMapPoint.Children
+                .Where(static c => c != null)
+                .ToList();
+        }
+
+        return new List<MapPoint>();
     }
 
     private static MapCoordSnapshot? BuildMapCoordSnapshot(MapCoord? mapCoord)
@@ -1201,6 +1379,9 @@ public static class ProbeModEntry
         string modeKey = ResolveModeKey(state);
         bool isInCombat = CombatManager.Instance.IsInProgress;
         uint? localCombatId = localPlayer?.Creature?.CombatId;
+        Dictionary<uint, Player> playersByCombatId = state.Players
+            .Where(static p => p.Creature.CombatId.HasValue)
+            .ToDictionary(static p => p.Creature.CombatId!.Value, static p => p);
 
         if (isInCombat && !_wasInCombat)
         {
@@ -1226,9 +1407,11 @@ public static class ProbeModEntry
                 ProcessHistoryEntryForStats(entry, localCombatId.Value, _totalStats);
                 ProcessHistoryEntryForStats(entry, localCombatId.Value, modeTotals);
                 ProcessHistoryEntryForStats(entry, localCombatId.Value, _activeBattle.Stats);
+                ProcessHistoryEntryForContribution(entry, state, modeKey, playersByCombatId);
             }
 
             _lastProcessedHistoryEntryCount = historyEntries.Count;
+            PrunePowerSourceTracker(state);
             _activeBattle.LastUpdatedUtc = DateTime.UtcNow;
             _activeBattle.LastEnemyAliveCount = state.Enemies.Count(static e => e.IsAlive);
             _activeBattle.LastRoundNumber = state.RoundNumber;
@@ -1245,6 +1428,15 @@ public static class ProbeModEntry
         }
 
         _wasInCombat = isInCombat;
+
+        foreach (Player player in state.Players)
+        {
+            uint? combatId = player.Creature.CombatId;
+            if (combatId.HasValue)
+            {
+                EnsureCombatContribution(combatId.Value, playersByCombatId);
+            }
+        }
 
         StatsAccumulator singleTotal = EnsureModeTotalsBucket("singleplayer");
         StatsAccumulator multiTotal = EnsureModeTotalsBucket("multiplayer");
@@ -1291,7 +1483,9 @@ public static class ProbeModEntry
             },
             RecentBattles = recentBattles,
             RecentCombatLog = BuildRecentCombatLog(combatHistory),
-            Highlights = BuildAnalyticsHighlights(state, localPlayer, currentCombatMetrics, modeKey)
+            Highlights = BuildAnalyticsHighlights(state, localPlayer, currentCombatMetrics, modeKey),
+            CurrentContributionBoard = BuildContributionBoardSnapshot(_combatContributions.Values),
+            TotalContributionBoard = BuildContributionBoardSnapshot(_totalContributions.Values)
         };
 
         return analytics;
@@ -1320,6 +1514,8 @@ public static class ProbeModEntry
             LastEnemyAliveCount = state.Enemies.Count(static e => e.IsAlive),
             LastRoundNumber = state.RoundNumber
         };
+        _combatContributions.Clear();
+        _powerSourceTracker.Clear();
         _lastProcessedHistoryEntryCount = 0;
     }
 
@@ -1462,6 +1658,601 @@ public static class ProbeModEntry
         }
     }
 
+    private static void ProcessHistoryEntryForContribution(
+        CombatHistoryEntry entry,
+        CombatState state,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        switch (entry)
+        {
+            case PowerReceivedEntry powerReceived:
+                TrackPowerSource(powerReceived, playersByCombatId);
+                TrackStatusApplication(powerReceived, modeKey, playersByCombatId);
+                break;
+            case DamageReceivedEntry damageReceived:
+                TrackDynamicDamageContribution(damageReceived, modeKey, playersByCombatId);
+                break;
+            case BlockGainedEntry blockGained:
+                TrackTeamBlockContribution(blockGained, modeKey, playersByCombatId);
+                break;
+        }
+    }
+
+    private static Dictionary<ulong, ContributionAccumulator> EnsureModeContributionBucket(string modeKey)
+    {
+        if (_modeContributions.TryGetValue(modeKey, out Dictionary<ulong, ContributionAccumulator>? bucket))
+        {
+            return bucket;
+        }
+
+        bucket = new Dictionary<ulong, ContributionAccumulator>();
+        _modeContributions[modeKey] = bucket;
+        return bucket;
+    }
+
+    private static ContributionAccumulator EnsureCombatContribution(
+        uint combatId,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        if (_combatContributions.TryGetValue(combatId, out ContributionAccumulator? existing))
+        {
+            if (playersByCombatId.TryGetValue(combatId, out Player? player))
+            {
+                existing.NetId = player.NetId;
+                existing.Name = ResolvePlayerDisplayName(player, combatId);
+            }
+
+            return existing;
+        }
+
+        ContributionAccumulator created;
+        if (playersByCombatId.TryGetValue(combatId, out Player? sourcePlayer))
+        {
+            created = new ContributionAccumulator
+            {
+                NetId = sourcePlayer.NetId,
+                Name = ResolvePlayerDisplayName(sourcePlayer, combatId)
+            };
+        }
+        else
+        {
+            created = new ContributionAccumulator
+            {
+                Name = "玩家#" + combatId.ToString(CultureInfo.InvariantCulture)
+            };
+        }
+
+        _combatContributions[combatId] = created;
+        return created;
+    }
+
+    private static ContributionAccumulator EnsureTotalContribution(
+        IDictionary<ulong, ContributionAccumulator> bucket,
+        ulong netId,
+        string name)
+    {
+        if (bucket.TryGetValue(netId, out ContributionAccumulator? existing))
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                existing.Name = name;
+            }
+
+            return existing;
+        }
+
+        ContributionAccumulator created = new()
+        {
+            NetId = netId,
+            Name = name
+        };
+        bucket[netId] = created;
+        return created;
+    }
+
+    private static void AddContribution(
+        uint actorCombatId,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId,
+        double ndps = 0,
+        double support = 0,
+        double mitigation = 0,
+        double teamBlock = 0,
+        int statusApplications = 0,
+        int offensiveDebuffs = 0,
+        int defensiveBuffs = 0)
+    {
+        ContributionAccumulator combat = EnsureCombatContribution(actorCombatId, playersByCombatId);
+        combat.Ndps += ndps;
+        combat.SupportDamage += support;
+        combat.Mitigation += mitigation;
+        combat.TeamBlock += teamBlock;
+        combat.StatusApplications += statusApplications;
+        combat.OffensiveDebuffsApplied += offensiveDebuffs;
+        combat.DefensiveBuffsApplied += defensiveBuffs;
+
+        if (combat.NetId == 0)
+        {
+            return;
+        }
+
+        ContributionAccumulator total = EnsureTotalContribution(_totalContributions, combat.NetId, combat.Name);
+        total.Ndps += ndps;
+        total.SupportDamage += support;
+        total.Mitigation += mitigation;
+        total.TeamBlock += teamBlock;
+        total.StatusApplications += statusApplications;
+        total.OffensiveDebuffsApplied += offensiveDebuffs;
+        total.DefensiveBuffsApplied += defensiveBuffs;
+
+        Dictionary<ulong, ContributionAccumulator> modeBucket = EnsureModeContributionBucket(modeKey);
+        ContributionAccumulator mode = EnsureTotalContribution(modeBucket, combat.NetId, combat.Name);
+        mode.Ndps += ndps;
+        mode.SupportDamage += support;
+        mode.Mitigation += mitigation;
+        mode.TeamBlock += teamBlock;
+        mode.StatusApplications += statusApplications;
+        mode.OffensiveDebuffsApplied += offensiveDebuffs;
+        mode.DefensiveBuffsApplied += defensiveBuffs;
+    }
+
+    private static string ResolvePlayerDisplayName(Player player, uint combatId)
+    {
+        string name = player.Creature.Name;
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            return name;
+        }
+
+        return "玩家#" + combatId.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static uint? ResolveContributorCombatId(
+        Creature? creature,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        if (creature == null)
+        {
+            return null;
+        }
+
+        uint? ownCombatId = creature.CombatId;
+        if (ownCombatId.HasValue && playersByCombatId.ContainsKey(ownCombatId.Value))
+        {
+            return ownCombatId.Value;
+        }
+
+        uint? ownerCombatId = creature.PetOwner?.Creature?.CombatId;
+        if (ownerCombatId.HasValue && playersByCombatId.ContainsKey(ownerCombatId.Value))
+        {
+            return ownerCombatId.Value;
+        }
+
+        return null;
+    }
+
+    private static void TrackPowerSource(
+        PowerReceivedEntry powerReceived,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        uint? receiverId = powerReceived.Actor.CombatId;
+        if (!receiverId.HasValue)
+        {
+            return;
+        }
+
+        PowerSourceKey key = new()
+        {
+            ReceiverCombatId = receiverId.Value,
+            PowerId = powerReceived.Power.Id.Entry
+        };
+
+        uint? applierCombatId = ResolveContributorCombatId(powerReceived.Applier, playersByCombatId);
+        ulong? applierNetId = null;
+        string applierName = string.Empty;
+        if (applierCombatId.HasValue && playersByCombatId.TryGetValue(applierCombatId.Value, out Player? applierPlayer))
+        {
+            applierNetId = applierPlayer.NetId;
+            applierName = ResolvePlayerDisplayName(applierPlayer, applierCombatId.Value);
+        }
+
+        _powerSourceTracker[key] = new PowerSourceRecord
+        {
+            ApplierCombatId = applierCombatId,
+            ApplierNetId = applierNetId,
+            ApplierName = applierName,
+            UpdatedUtc = DateTime.UtcNow
+        };
+    }
+
+    private static void TrackStatusApplication(
+        PowerReceivedEntry powerReceived,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        uint? applierCombatId = ResolveContributorCombatId(powerReceived.Applier, playersByCombatId);
+        if (!applierCombatId.HasValue || !playersByCombatId.ContainsKey(applierCombatId.Value))
+        {
+            return;
+        }
+
+        string powerType = powerReceived.Power.Type.ToString();
+        uint? receiverContributorCombatId = ResolveContributorCombatId(powerReceived.Actor, playersByCombatId);
+        bool isDebuffOnEnemy = powerReceived.Actor.Side == CombatSide.Enemy
+            && powerType.Contains("Debuff", StringComparison.OrdinalIgnoreCase);
+        bool isBuffOnAlly = powerReceived.Actor.Side == CombatSide.Player
+            && powerType.Contains("Buff", StringComparison.OrdinalIgnoreCase)
+            && receiverContributorCombatId.HasValue
+            && receiverContributorCombatId.Value != applierCombatId.Value;
+
+        if (!isDebuffOnEnemy && !isBuffOnAlly)
+        {
+            return;
+        }
+
+        AddContribution(
+            applierCombatId.Value,
+            modeKey,
+            playersByCombatId,
+            statusApplications: 1,
+            offensiveDebuffs: isDebuffOnEnemy ? 1 : 0,
+            defensiveBuffs: isBuffOnAlly ? 1 : 0);
+    }
+
+    private static void TrackTeamBlockContribution(
+        BlockGainedEntry blockGained,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        if (blockGained.Amount <= 0 || blockGained.Receiver.Side != CombatSide.Player)
+        {
+            return;
+        }
+
+        uint? receiverCombatId = ResolveContributorCombatId(blockGained.Receiver, playersByCombatId);
+        uint? sourceCombatId = blockGained.CardPlay?.Card?.Owner?.Creature?.CombatId;
+        if (!sourceCombatId.HasValue || !receiverCombatId.HasValue)
+        {
+            return;
+        }
+
+        if (sourceCombatId.Value == receiverCombatId.Value)
+        {
+            return;
+        }
+
+        if (!playersByCombatId.ContainsKey(sourceCombatId.Value))
+        {
+            return;
+        }
+
+        AddContribution(
+            sourceCombatId.Value,
+            modeKey,
+            playersByCombatId,
+            teamBlock: blockGained.Amount);
+    }
+
+    private static void TrackDynamicDamageContribution(
+        DamageReceivedEntry damageReceived,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        int observedDamage = Math.Max(0, damageReceived.Result.TotalDamage);
+        Creature? dealer = damageReceived.Dealer;
+        if (observedDamage <= 0 || dealer == null)
+        {
+            return;
+        }
+
+        uint? dealerRawCombatId = dealer.CombatId;
+        if (!dealerRawCombatId.HasValue)
+        {
+            return;
+        }
+
+        if (dealer.Side == CombatSide.Player && damageReceived.Receiver.Side == CombatSide.Enemy)
+        {
+            uint? dealerCombatId = ResolveContributorCombatId(dealer, playersByCombatId);
+            if (!dealerCombatId.HasValue)
+            {
+                return;
+            }
+
+            AddContribution(
+                dealerCombatId.Value,
+                modeKey,
+                playersByCombatId,
+                ndps: 0);
+
+            List<ResolvedPowerModifier> targetDebuffModifiers = ResolveDynamicDamageMultipliers(
+                damageReceived.Receiver,
+                damageReceived.Receiver,
+                dealer,
+                damageReceived.CardSource,
+                damageReceived.Result.Props,
+                observedDamage,
+                playersByCombatId)
+                .Where(m =>
+                    m.Multiplier > 1.0001
+                    && m.ApplierCombatId.HasValue
+                    && m.ApplierCombatId.Value != dealerCombatId.Value
+                    && playersByCombatId.ContainsKey(m.ApplierCombatId.Value))
+                .ToList();
+
+            double teammateMultiplier = targetDebuffModifiers.Aggregate(1d, static (current, m) => current * m.Multiplier);
+            teammateMultiplier = Math.Max(1d, teammateMultiplier);
+            double ndps = observedDamage / teammateMultiplier;
+            double supportDamage = Math.Max(0, observedDamage - ndps);
+            AddContribution(
+                dealerCombatId.Value,
+                modeKey,
+                playersByCombatId,
+                ndps: ndps);
+
+            DistributeContributionByMultiplierWeight(
+                targetDebuffModifiers,
+                supportDamage,
+                modeKey,
+                playersByCombatId,
+                isMitigation: false);
+            return;
+        }
+
+        if (dealer.Side != CombatSide.Enemy || damageReceived.Receiver.Side != CombatSide.Player)
+        {
+            return;
+        }
+
+        List<ResolvedPowerModifier> outgoingDebuffModifiers = ResolveDynamicDamageMultipliers(
+            dealer,
+            damageReceived.Receiver,
+            dealer,
+            damageReceived.CardSource,
+            damageReceived.Result.Props,
+            observedDamage,
+            playersByCombatId)
+            .Where(m =>
+                m.Multiplier < 0.9999
+                && m.ApplierCombatId.HasValue
+                && playersByCombatId.ContainsKey(m.ApplierCombatId.Value))
+            .ToList();
+
+        if (outgoingDebuffModifiers.Count == 0)
+        {
+            return;
+        }
+
+        double teamDebuffMultiplier = outgoingDebuffModifiers.Aggregate(1d, static (current, m) => current * m.Multiplier);
+        if (teamDebuffMultiplier <= 0 || teamDebuffMultiplier >= 1d)
+        {
+            return;
+        }
+
+        double noDebuffDamage = observedDamage / teamDebuffMultiplier;
+        double mitigation = Math.Max(0, noDebuffDamage - observedDamage);
+        DistributeContributionByMultiplierWeight(
+            outgoingDebuffModifiers,
+            mitigation,
+            modeKey,
+            playersByCombatId,
+            isMitigation: true);
+    }
+
+    private static void DistributeContributionByMultiplierWeight(
+        IReadOnlyList<ResolvedPowerModifier> modifiers,
+        double totalContribution,
+        string modeKey,
+        IReadOnlyDictionary<uint, Player> playersByCombatId,
+        bool isMitigation)
+    {
+        if (totalContribution <= 0 || modifiers.Count == 0)
+        {
+            return;
+        }
+
+        List<(uint applier, double weight)> weighted = new();
+        double totalWeight = 0;
+        foreach (ResolvedPowerModifier modifier in modifiers)
+        {
+            if (!modifier.ApplierCombatId.HasValue)
+            {
+                continue;
+            }
+
+            uint applierId = modifier.ApplierCombatId.Value;
+            if (!playersByCombatId.ContainsKey(applierId))
+            {
+                continue;
+            }
+
+            double weight = modifier.Multiplier > 1
+                ? Math.Log(modifier.Multiplier)
+                : Math.Abs(Math.Log(Math.Max(0.0001, modifier.Multiplier)));
+            if (weight <= 0)
+            {
+                continue;
+            }
+
+            weighted.Add((applierId, weight));
+            totalWeight += weight;
+        }
+
+        if (weighted.Count == 0)
+        {
+            return;
+        }
+
+        if (totalWeight <= 0)
+        {
+            totalWeight = weighted.Count;
+            weighted = weighted
+                .Select(static pair => (pair.applier, weight: 1d))
+                .ToList();
+        }
+
+        foreach ((uint applier, double weight) in weighted)
+        {
+            double amount = totalContribution * weight / totalWeight;
+            if (isMitigation)
+            {
+                AddContribution(
+                    applier,
+                    modeKey,
+                    playersByCombatId,
+                    mitigation: amount);
+            }
+            else
+            {
+                AddContribution(
+                    applier,
+                    modeKey,
+                    playersByCombatId,
+                    support: amount);
+            }
+        }
+    }
+
+    private static List<ResolvedPowerModifier> ResolveDynamicDamageMultipliers(
+        Creature powerOwner,
+        Creature target,
+        Creature? dealer,
+        CardModel? cardSource,
+        ValueProp props,
+        int observedDamage,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        List<ResolvedPowerModifier> resolved = new();
+        uint? ownerCombatId = powerOwner.CombatId;
+        if (!ownerCombatId.HasValue)
+        {
+            return resolved;
+        }
+
+        decimal probeAmount = Math.Max(1, observedDamage);
+        foreach (PowerModel power in powerOwner.Powers)
+        {
+            decimal multiplier;
+            try
+            {
+                multiplier = power.ModifyDamageMultiplicative(target, probeAmount, props, dealer, cardSource);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (multiplier <= 0m || multiplier == 1m)
+            {
+                continue;
+            }
+
+            PowerSourceRecord? source = null;
+            PowerSourceKey key = new()
+            {
+                ReceiverCombatId = ownerCombatId.Value,
+                PowerId = power.Id.Entry
+            };
+            _powerSourceTracker.TryGetValue(key, out source);
+
+            uint? applierCombatId = source?.ApplierCombatId;
+            ulong? applierNetId = source?.ApplierNetId;
+            string applierName = source?.ApplierName ?? string.Empty;
+            if (applierCombatId.HasValue && playersByCombatId.TryGetValue(applierCombatId.Value, out Player? applier))
+            {
+                applierNetId = applier.NetId;
+                applierName = ResolvePlayerDisplayName(applier, applierCombatId.Value);
+            }
+
+            resolved.Add(new ResolvedPowerModifier
+            {
+                OwnerCombatId = ownerCombatId.Value,
+                ApplierCombatId = applierCombatId,
+                ApplierNetId = applierNetId,
+                ApplierName = applierName,
+                PowerId = power.Id.Entry,
+                Multiplier = (double)multiplier
+            });
+        }
+
+        return resolved;
+    }
+
+    private static void PrunePowerSourceTracker(CombatState state)
+    {
+        if (_powerSourceTracker.Count == 0)
+        {
+            return;
+        }
+
+        List<PowerSourceKey> staleKeys = new();
+        foreach ((PowerSourceKey key, _) in _powerSourceTracker)
+        {
+            Creature? receiver = state.GetCreature(key.ReceiverCombatId);
+            if (receiver == null || !receiver.IsAlive)
+            {
+                staleKeys.Add(key);
+                continue;
+            }
+
+            bool powerStillActive = receiver.Powers.Any(power => string.Equals(power.Id.Entry, key.PowerId, StringComparison.Ordinal));
+            if (!powerStillActive)
+            {
+                staleKeys.Add(key);
+            }
+        }
+
+        foreach (PowerSourceKey key in staleKeys)
+        {
+            _powerSourceTracker.Remove(key);
+        }
+    }
+
+    private static List<PlayerContributionSnapshot> BuildContributionBoardSnapshot(IEnumerable<ContributionAccumulator> source)
+    {
+        List<PlayerContributionSnapshot> rows = source
+            .Select(acc =>
+            {
+                double statusScore = acc.StatusApplications * 3.0
+                    + acc.OffensiveDebuffsApplied * 1.8
+                    + acc.DefensiveBuffsApplied * 1.2
+                    + acc.SupportDamage * 0.12
+                    + acc.Mitigation * 0.16;
+                double contributionScore = acc.Ndps
+                    + acc.SupportDamage
+                    + acc.Mitigation
+                    + acc.TeamBlock * 0.75
+                    + statusScore;
+
+                return new PlayerContributionSnapshot
+                {
+                    NetId = acc.NetId,
+                    Name = acc.Name,
+                    Ndps = Math.Round(acc.Ndps, 2),
+                    SupportDamage = Math.Round(acc.SupportDamage, 2),
+                    Mitigation = Math.Round(acc.Mitigation, 2),
+                    TeamBlock = Math.Round(acc.TeamBlock, 2),
+                    StatusScore = Math.Round(statusScore, 2),
+                    StatusApplications = acc.StatusApplications,
+                    OffensiveDebuffsApplied = acc.OffensiveDebuffsApplied,
+                    DefensiveBuffsApplied = acc.DefensiveBuffsApplied,
+                    ContributionScore = Math.Round(contributionScore, 2)
+                };
+            })
+            .OrderByDescending(static row => row.ContributionScore)
+            .ThenBy(static row => row.Name, StringComparer.Ordinal)
+            .ToList();
+
+        double total = rows.Sum(static row => row.ContributionScore);
+        foreach (PlayerContributionSnapshot row in rows)
+        {
+            row.Ratio = total <= 0 ? 0 : Math.Clamp(row.ContributionScore / total, 0, 1);
+        }
+
+        return rows;
+    }
+
     private static CardStatAccumulator GetOrCreateCardStats(StatsAccumulator stats, string cardId)
     {
         if (stats.CardStats.TryGetValue(cardId, out CardStatAccumulator? existing))
@@ -1570,8 +2361,11 @@ public static class ProbeModEntry
             CardsPlayed = stats.CardsPlayed,
             BuffsApplied = stats.BuffsApplied,
             DebuffsApplied = stats.DebuffsApplied,
+            UniqueBuffKinds = stats.BuffCounts.Count,
+            UniqueDebuffKinds = stats.DebuffCounts.Count,
             DamagePerEnergy = Math.Round(SafeDivide(stats.DamageDealt, stats.EnergySpent), 4),
             TempoScore = stats.DamageDealt - stats.DamageTaken,
+            StatusScore = Math.Round(stats.BuffsApplied * 1.2 + stats.DebuffsApplied * 1.5 + stats.BuffCounts.Count * 0.8 + stats.DebuffCounts.Count * 1.0, 3),
             TopCards = topCards,
             TopBuffs = topBuffs,
             TopDebuffs = topDebuffs
@@ -1744,7 +2538,7 @@ public static class ProbeModEntry
         int maxHp = localPlayer?.Creature.MaxHp ?? 0;
         int energy = localPlayer?.PlayerCombatState?.Energy ?? 0;
         CombatMetricsSnapshot current = analytics.CurrentCombat;
-        return $"HP {hp}/{maxHp}, Energy {energy}, Dmg {current.DamageDealt}, Block {current.BlockGained}, Overkill {current.OverkillDamage}, Cards {current.CardsPlayed}";
+        return $"生命 {hp}/{maxHp}，能量 {energy}，伤害 {current.DamageDealt}，格挡 {current.BlockGained}，状态分 {current.StatusScore:F1}，出牌 {current.CardsPlayed}";
     }
 
     private static List<string> BuildDashboardAlerts(AnalyticsSnapshot analytics)
@@ -1840,101 +2634,280 @@ public static class ProbeModEntry
             RoutePanel = routeText,
             LogsPanel = logsText,
             CombatBoardScope = analytics.IsInCombat ? "当前战斗" : "最近一场",
-            CombatDamageBoard = BuildOverlayDamageBoard(state, historyEntries, localPlayer),
+            CombatDamageBoard = BuildOverlayContributionBoard(analytics, localPlayer),
+            RouteLegendEntries = BuildOverlayRouteLegendEntries(routePlan),
+            RouteOptions = BuildOverlayRouteOptions(routePlan),
+            SelectedRouteOptionIndex = -1,
+            ModifierState = BuildOverlayModifierState(localPlayer),
             Alerts = BuildDashboardAlerts(analytics)
         };
     }
 
-    private static List<OverlayDamageEntry> BuildOverlayDamageBoard(
-        CombatState state,
-        IReadOnlyList<CombatHistoryEntry> historyEntries,
-        Player? localPlayer)
+    private static List<OverlayRouteLegendEntry> BuildOverlayRouteLegendEntries(RoutePlanSnapshot routePlan)
     {
-        Dictionary<uint, int> damageByDealer = new();
-        foreach (CombatHistoryEntry entry in historyEntries)
+        List<OverlayRouteLegendEntry> entries = new();
+        foreach (RouteReachableTypeSnapshot type in routePlan.ReachableByType)
         {
-            if (entry is not DamageReceivedEntry damageReceived)
+            entries.Add(new OverlayRouteLegendEntry
             {
-                continue;
-            }
-
-            Creature? dealer = damageReceived.Dealer;
-            if (dealer == null)
-            {
-                continue;
-            }
-
-            if (!string.Equals(dealer.Side.ToString(), "Player", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            int dealt = Math.Max(0, damageReceived.Result.UnblockedDamage + damageReceived.Result.BlockedDamage);
-            if (dealt <= 0)
-            {
-                continue;
-            }
-
-            uint? dealerId = dealer.CombatId;
-            if (!dealerId.HasValue)
-            {
-                continue;
-            }
-
-            damageByDealer.TryGetValue(dealerId.Value, out int oldValue);
-            damageByDealer[dealerId.Value] = oldValue + dealt;
-        }
-
-        uint? localCombatId = localPlayer?.Creature?.CombatId;
-        List<OverlayDamageEntry> rows = new();
-        HashSet<uint> seen = new();
-        foreach (Player player in state.Players)
-        {
-            uint? combatId = player.Creature.CombatId;
-            if (!combatId.HasValue)
-            {
-                continue;
-            }
-
-            seen.Add(combatId.Value);
-            damageByDealer.TryGetValue(combatId.Value, out int dmg);
-            rows.Add(new OverlayDamageEntry
-            {
-                Name = string.IsNullOrWhiteSpace(player.Creature.Name)
-                    ? "玩家#" + player.NetId.ToString(CultureInfo.InvariantCulture)
-                    : player.Creature.Name,
-                Damage = dmg,
-                IsLocalPlayer = localCombatId.HasValue && localCombatId.Value == combatId.Value
+                TypeKey = type.TypeKey,
+                Count = type.Count,
+                Label = $"{type.Label} {type.Count}"
             });
         }
 
-        foreach ((uint dealerId, int dmg) in damageByDealer)
-        {
-            if (seen.Contains(dealerId))
-            {
-                continue;
-            }
+        return entries;
+    }
 
-            rows.Add(new OverlayDamageEntry
+    private static AnalyticsSnapshot BuildFallbackAnalytics(string modeKey)
+    {
+        StatsAccumulator singleTotal = _modeTotals.TryGetValue("singleplayer", out StatsAccumulator? s) ? s : new StatsAccumulator();
+        StatsAccumulator multiTotal = _modeTotals.TryGetValue("multiplayer", out StatsAccumulator? m) ? m : new StatsAccumulator();
+
+        return new AnalyticsSnapshot
+        {
+            ModId = ModId,
+            TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+            Mode = modeKey,
+            IsInCombat = false,
+            CurrentCombat = new CombatMetricsSnapshot(),
+            Total = BuildMetricsSnapshot(_totalStats),
+            Singleplayer = new ModeMetricsSnapshot
             {
-                Name = "玩家#" + dealerId.ToString(CultureInfo.InvariantCulture),
-                Damage = dmg,
-                IsLocalPlayer = localCombatId.HasValue && localCombatId.Value == dealerId
-            });
+                Mode = "singleplayer",
+                Total = BuildMetricsSnapshot(singleTotal),
+                RecentBattles = new List<BattleSegmentSnapshot>()
+            },
+            Multiplayer = new ModeMetricsSnapshot
+            {
+                Mode = "multiplayer",
+                Total = BuildMetricsSnapshot(multiTotal),
+                RecentBattles = new List<BattleSegmentSnapshot>()
+            },
+            RecentBattles = new List<BattleSegmentSnapshot>(),
+            RecentCombatLog = new List<CombatLogLineSnapshot>(),
+            Highlights = new AnalyticsHighlightsSnapshot
+            {
+                Mode = modeKey,
+                DangerLevel = "low"
+            },
+            RouteHistory = new RouteHistoryStatsSnapshot(),
+            CurrentContributionBoard = new List<PlayerContributionSnapshot>(),
+            TotalContributionBoard = BuildContributionBoardSnapshot(_totalContributions.Values)
+        };
+    }
+
+    private static List<OverlayRouteOption> BuildOverlayRouteOptions(RoutePlanSnapshot routePlan)
+    {
+        List<OverlayRouteOption> options = new();
+        int index = 0;
+        foreach (RouteOptionSnapshot option in routePlan.Options)
+        {
+            OverlayRouteOption row = new()
+            {
+                OptionIndex = index,
+                Label = $"路线{index + 1}",
+                PointTypeLabel = option.PointTypeLabel,
+                Score = option.Score,
+                RiskTag = option.RiskTag,
+                PathTypeKeys = option.PathTypeKeys.ToList(),
+                PathCoords = option.PathCoords
+                    .Select(static p => new OverlayRouteCoord
+                    {
+                        Row = p.Row,
+                        Col = p.Col
+                    })
+                    .ToList()
+            };
+            options.Add(row);
+            index++;
         }
 
-        rows = rows
-            .OrderByDescending(static r => r.Damage)
-            .ThenBy(static r => r.Name, StringComparer.Ordinal)
+        return options;
+    }
+
+    private static List<OverlayDamageEntry> BuildOverlayContributionBoard(AnalyticsSnapshot analytics, Player? localPlayer)
+    {
+        List<PlayerContributionSnapshot> board = analytics.CurrentContributionBoard ?? new List<PlayerContributionSnapshot>();
+        ulong localNetId = localPlayer?.NetId ?? 0;
+        return board
+            .Select(row => new OverlayDamageEntry
+            {
+                Name = row.Name,
+                ContributionScore = row.ContributionScore,
+                Ndps = row.Ndps,
+                SupportDamage = row.SupportDamage,
+                Mitigation = row.Mitigation,
+                TeamBlock = row.TeamBlock,
+                StatusScore = row.StatusScore,
+                Ratio = row.Ratio,
+                IsLocalPlayer = localNetId != 0 && row.NetId == localNetId
+            })
+            .OrderByDescending(static row => row.ContributionScore)
+            .ThenBy(static row => row.Name, StringComparer.Ordinal)
             .ToList();
+    }
 
-        int total = rows.Sum(static r => r.Damage);
-        foreach (OverlayDamageEntry row in rows)
+    private static OverlayModifierState BuildOverlayModifierState(Player? localPlayer)
+    {
+        OverlayModifierState state = new();
+        if (localPlayer == null)
         {
-            row.Ratio = total <= 0 ? 0 : Math.Clamp((double)row.Damage / total, 0, 1);
+            return state;
         }
 
-        return rows;
+        state.PlayerName = ResolvePlayerDisplayName(localPlayer, localPlayer.Creature?.CombatId ?? 0);
+        state.CharacterId = localPlayer.Character?.Id.Entry ?? string.Empty;
+        state.CurrentHp = localPlayer.Creature?.CurrentHp ?? 0;
+        state.MaxHp = localPlayer.Creature?.MaxHp ?? 0;
+        state.Gold = localPlayer.Gold;
+        state.RelicCount = localPlayer.Relics.Count;
+        state.DeckCount = localPlayer.Deck.Cards.Count;
+        state.Relics = localPlayer.Relics
+            .Select(static relic => new OverlayModifierOwnedRelic
+            {
+                RelicId = relic.Id.Entry,
+                Title = SafeText(() => relic.Title.GetFormattedText(), relic.Id.Entry)
+            })
+            .OrderBy(static relic => relic.Title, StringComparer.Ordinal)
+            .ToList();
+        state.DeckCards = localPlayer.Deck.Cards
+            .Select((card, index) => new OverlayModifierDeckCardEntry
+            {
+                DeckIndex = index,
+                CardId = card.Id.Entry,
+                Title = SafeText(() => card.Title, card.Id.Entry),
+                UpgradeLevel = card.CurrentUpgradeLevel,
+                IsUpgradable = card.IsUpgradable
+            })
+            .ToList();
+        return state;
+    }
+
+    internal static IReadOnlyList<OverlayModifierCatalogEntry> GetModifierCardCatalog()
+    {
+        lock (ModifierCatalogLock)
+        {
+            _cardCatalogCache ??= BuildModifierCardCatalog();
+            return _cardCatalogCache;
+        }
+    }
+
+    internal static IReadOnlyList<OverlayModifierCatalogEntry> GetModifierRelicCatalog()
+    {
+        lock (ModifierCatalogLock)
+        {
+            _relicCatalogCache ??= BuildModifierRelicCatalog();
+            return _relicCatalogCache;
+        }
+    }
+
+    public static void SetCurrentLocalPlayerHp(int hp)
+    {
+        _ = ExecuteModifierActionAsync(
+            "set_hp",
+            async player =>
+            {
+                int value = Math.Clamp(hp, 0, player.Creature.MaxHp);
+                await CreatureCmd.SetCurrentHp(player.Creature, value);
+                return $"当前生命已设置为 {value}/{player.Creature.MaxHp}";
+            });
+    }
+
+    public static void SetCurrentLocalPlayerGold(int gold)
+    {
+        _ = ExecuteModifierActionAsync(
+            "set_gold",
+            async player =>
+            {
+                int value = Math.Max(0, gold);
+                await PlayerCmd.SetGold(value, player);
+                return $"金币已设置为 {value}";
+            });
+    }
+
+    public static void AddRelicToCurrentRun(string relicId)
+    {
+        _ = ExecuteModifierActionAsync(
+            "add_relic",
+            async player =>
+            {
+                RelicModel? canonical = ModelDb.AllRelics.FirstOrDefault(r =>
+                    string.Equals(r.Id.Entry, relicId, StringComparison.OrdinalIgnoreCase));
+                if (canonical == null)
+                {
+                    throw new InvalidOperationException("未找到遗物: " + relicId);
+                }
+
+                if (!canonical.IsStackable && player.GetRelicById(canonical.Id) != null)
+                {
+                    throw new InvalidOperationException("当前已拥有该遗物且不可叠加: " + canonical.Id.Entry);
+                }
+
+                RelicModel relic = canonical.ToMutable();
+                await RelicCmd.Obtain(relic, player, player.Relics.Count);
+                return $"已添加遗物 {SafeText(() => canonical.Title.GetFormattedText(), canonical.Id.Entry)}";
+            });
+    }
+
+    public static void AddCardToCurrentDeck(string cardId)
+    {
+        _ = ExecuteModifierActionAsync(
+            "add_card",
+            async player =>
+            {
+                RunState runState = ResolveCurrentRunState()
+                    ?? player.RunState as RunState
+                    ?? throw new InvalidOperationException("当前 RunState 不可用。");
+                CardModel? canonical = ModelDb.AllCards.FirstOrDefault(c =>
+                    string.Equals(c.Id.Entry, cardId, StringComparison.OrdinalIgnoreCase));
+                if (canonical == null)
+                {
+                    throw new InvalidOperationException("未找到卡牌: " + cardId);
+                }
+
+                CardModel card = runState.CreateCard(canonical, player);
+                if (!runState.ContainsCard(card))
+                {
+                    runState.AddCard(card, player);
+                }
+
+                await CardPileCmd.Add(card, player.Deck, CardPilePosition.Bottom, player.Character, skipVisuals: true);
+                return $"已加入卡牌 {SafeText(() => canonical.Title, canonical.Id.Entry)}";
+            });
+    }
+
+    public static void UpgradeCurrentDeckCard(int deckIndex)
+    {
+        _ = ExecuteModifierActionAsync(
+            "upgrade_card",
+            player =>
+            {
+                if (deckIndex < 0 || deckIndex >= player.Deck.Cards.Count)
+                {
+                    throw new InvalidOperationException("卡牌索引超出范围: " + deckIndex.ToString(CultureInfo.InvariantCulture));
+                }
+
+                CardModel card = player.Deck.Cards[deckIndex];
+                if (!card.IsUpgradable)
+                {
+                    throw new InvalidOperationException("该卡牌当前不可升级: " + card.Id.Entry);
+                }
+
+                card.UpgradeInternal();
+                card.FinalizeUpgradeInternal();
+                return Task.FromResult($"已升级卡牌 {SafeText(() => card.Title, card.Id.Entry)} 到 +{card.CurrentUpgradeLevel}");
+            });
+    }
+
+    private static string ModeLabel(string mode)
+    {
+        return mode switch
+        {
+            "singleplayer" => "单机",
+            "multiplayer" => "联机",
+            _ => mode
+        };
     }
 
     private static string BuildOverlayCombatText(Player? localPlayer, AnalyticsSnapshot analytics)
@@ -1946,12 +2919,13 @@ public static class ProbeModEntry
         CombatMetricsSnapshot m = analytics.CurrentCombat;
         List<string> lines = new()
         {
-            $"状态: {(analytics.IsInCombat ? "战斗中" : "非战斗")} | 模式: {analytics.Mode}",
-            $"HP {hp}/{maxHp} | 格挡 {block} | 能量 {energy}",
+            $"状态: {(analytics.IsInCombat ? "战斗中" : "非战斗")} | 模式: {ModeLabel(analytics.Mode)}",
+            $"生命 {hp}/{maxHp} | 格挡 {block} | 能量 {energy}",
             $"来伤估计 {analytics.Highlights.IncomingDamageEstimate} | 未格挡威胁 {analytics.Highlights.UnblockedThreatEstimate}",
             $"伤害 {m.DamageDealt} | 受伤 {m.DamageTaken} | 挡下 {m.DamageBlocked} | 过量 {m.OverkillDamage}",
             $"打牌 {m.CardsPlayed} | 能量消耗 {m.EnergySpent} | 伤害效率 {m.DamagePerEnergy:F2} / 能量",
-            $"Buff {m.BuffsApplied} | Debuff {m.DebuffsApplied} | 节奏分 {m.TempoScore}"
+            $"增益施加 {m.BuffsApplied} ({m.UniqueBuffKinds} 种) | 减益施加 {m.DebuffsApplied} ({m.UniqueDebuffKinds} 种)",
+            $"状态分 {m.StatusScore:F1} | 节奏分 {m.TempoScore}"
         };
 
         CardMetricSnapshot? top = m.TopCards.FirstOrDefault();
@@ -1982,12 +2956,14 @@ public static class ProbeModEntry
             $"伤害 {total.DamageDealt} | 受伤 {total.DamageTaken} | 挡下 {total.DamageBlocked}",
             $"格挡获得 {total.BlockGained} | 能量消耗 {total.EnergySpent} | 过量伤害 {total.OverkillDamage}",
             $"打牌 {total.CardsPlayed} | 总伤害效率 {total.DamagePerEnergy:F2}",
+            $"增益施加 {total.BuffsApplied} ({total.UniqueBuffKinds} 种) | 减益施加 {total.DebuffsApplied} ({total.UniqueDebuffKinds} 种)",
+            $"状态分 {total.StatusScore:F1}",
             "",
             "单机累计",
-            $"战斗样本 {analytics.Singleplayer.RecentBattles.Count} (近期) | 伤害效率 {single.DamagePerEnergy:F2}",
+            $"战斗样本 {analytics.Singleplayer.RecentBattles.Count} (近期) | 伤害效率 {single.DamagePerEnergy:F2} | 状态分 {single.StatusScore:F1}",
             "",
             "联机累计",
-            $"战斗样本 {analytics.Multiplayer.RecentBattles.Count} (近期) | 伤害效率 {multi.DamagePerEnergy:F2}"
+            $"战斗样本 {analytics.Multiplayer.RecentBattles.Count} (近期) | 伤害效率 {multi.DamagePerEnergy:F2} | 状态分 {multi.StatusScore:F1}"
         };
 
         if (total.TopCards.Count > 0)
@@ -2009,8 +2985,17 @@ public static class ProbeModEntry
         List<string> lines = new()
         {
             $"路线策略: {routePlan.Strategy}",
-            $"当前层数: {routePlan.CurrentFloor} | 血线比: {(routePlan.HpRatio * 100):F1}%"
+            $"当前层数: {routePlan.CurrentFloor} | 血线比: {(routePlan.HpRatio * 100):F1}%",
+            $"可达节点: {routePlan.ReachableNodeCount}"
         };
+
+        if (routePlan.ReachableByType.Count > 0)
+        {
+            lines.Add("前方全图统计:");
+            lines.Add(string.Join(" | ", routePlan.ReachableByType
+                .Take(8)
+                .Select(static type => $"{type.Label}{type.Count}")));
+        }
 
         RouteHistoryStatsSnapshot history = routePlan.HistoricalStats;
         if (history.TotalVisited > 0)
@@ -2052,7 +3037,7 @@ public static class ProbeModEntry
         {
             RouteOptionSnapshot s = routePlan.Suggested;
             lines.Add(
-                $"建议: ({s.Coord.Row},{s.Coord.Col}) {s.PointType} | 分数 {s.Score:F2} | 风险 {s.RiskTag}");
+                $"建议: ({s.Coord.Row},{s.Coord.Col}) {s.PointTypeLabel} | 分数 {s.Score:F2} | 风险 {s.RiskTag}");
             if (s.PathPreview.Count > 0)
             {
                 lines.Add("预览: " + string.Join(" -> ", s.PathPreview.Take(5)));
@@ -2071,7 +3056,7 @@ public static class ProbeModEntry
             foreach (RouteOptionSnapshot option in routePlan.Options.Skip(1).Take(3))
             {
                 lines.Add(
-                    $"- ({option.Coord.Row},{option.Coord.Col}) {option.PointType} | {option.Score:F2} | {option.RiskTag}");
+                    $"- ({option.Coord.Row},{option.Coord.Col}) {option.PointTypeLabel} | {option.Score:F2} | {option.RiskTag}");
             }
         }
 
@@ -2113,6 +3098,7 @@ public static class ProbeModEntry
     private static RoutePlanSnapshot BuildRoutePlanSnapshot(CombatState state, Player? localPlayer)
     {
         IRunState runState = state.RunState;
+        string modeKey = ResolveModeKey(state);
         double hpRatio = 1;
         if (localPlayer != null && localPlayer.Creature.MaxHp > 0)
         {
@@ -2120,55 +3106,300 @@ public static class ProbeModEntry
         }
 
         int gold = localPlayer?.Gold ?? 0;
+        return BuildRoutePlanSnapshot(runState, localPlayer, modeKey, hpRatio, gold);
+    }
+
+    private static RoutePlanSnapshot BuildRoutePlanSnapshot(
+        IRunState runState,
+        Player? localPlayer,
+        string modeKey,
+        double hpRatio,
+        int gold)
+    {
+        List<MapPoint> nextChoices = GetNextRouteChoices(runState);
+        MapCoord? routeStartCoord = ResolveRouteStartCoord(runState);
         RoutePlanSnapshot snapshot = new()
         {
             TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
-            Mode = ResolveModeKey(state),
+            Mode = modeKey,
             CurrentFloor = runState.TotalFloor,
             HpRatio = Math.Round(hpRatio, 4),
             Strategy = BuildRouteStrategy(hpRatio, gold),
-            HasMapContext = runState.CurrentMapPoint != null,
+            HasMapContext = runState.CurrentMapPoint != null || nextChoices.Count > 0,
             HistoricalStats = BuildRouteHistoryStats(runState, localPlayer),
+            ReachableByType = BuildReachableRouteTypeCounts(runState),
             Options = new List<RouteOptionSnapshot>()
         };
+        snapshot.ReachableNodeCount = snapshot.ReachableByType.Sum(static type => type.Count);
         snapshot.Insights = BuildRouteInsights(snapshot.HistoricalStats, hpRatio, gold);
 
-        if (runState.CurrentMapPoint == null)
+        if (nextChoices.Count == 0)
         {
             return snapshot;
         }
 
-        IEnumerable<MapPoint> children = runState.CurrentMapPoint.Children
+        IEnumerable<MapPoint> children = nextChoices
             .OrderBy(static c => c.coord.row)
             .ThenBy(static c => c.coord.col);
 
         foreach (MapPoint child in children)
         {
-            RouteEval eval = EvaluateRoute(child, 1, hpRatio, gold);
-            List<string> preview = eval.PathTypes.Take(6).ToList();
-            RouteOptionSnapshot option = new()
+            foreach (RouteEval eval in EvaluateRoutes(child, hpRatio, gold))
             {
-                Coord = new MapCoordSnapshot
+                List<string> pathTypeKeys = (eval.PathTypeKeys ?? new List<string>())
+                    .Where(static key => !string.IsNullOrWhiteSpace(key))
+                    .ToList();
+                if (pathTypeKeys.Count == 0)
                 {
-                    Col = child.coord.col,
-                    Row = child.coord.row
-                },
-                PointType = child.PointType.ToString(),
-                Score = Math.Round(eval.Score, 4),
-                RiskTag = BuildRiskTag(child.PointType.ToString(), hpRatio),
-                PathPreview = preview,
-                Reasons = BuildRouteReasons(child.PointType.ToString(), hpRatio, gold)
-            };
-            snapshot.Options.Add(option);
+                    pathTypeKeys.Add(NormalizeRouteTypeKey(child.PointType.ToString()));
+                }
+
+                List<MapCoordSnapshot> pathCoords = BuildRoutePathCoords(runState, routeStartCoord, eval.PathCoords, child.coord);
+                List<string> preview = pathTypeKeys
+                    .Select(RouteTypeKeyToLabel)
+                    .Take(6)
+                    .ToList();
+                RouteOptionSnapshot option = new()
+                {
+                    Coord = new MapCoordSnapshot
+                    {
+                        Col = child.coord.col,
+                        Row = child.coord.row
+                    },
+                    PointType = child.PointType.ToString(),
+                    PointTypeLabel = RouteTypeKeyToLabel(NormalizeRouteTypeKey(child.PointType.ToString())),
+                    Score = Math.Round(eval.Score, 4),
+                    RiskTag = BuildRiskTag(child.PointType.ToString(), hpRatio),
+                    PathTypeKeys = pathTypeKeys,
+                    PathCoords = pathCoords,
+                    PathPreview = preview,
+                    Reasons = BuildRouteReasons(child.PointType.ToString(), hpRatio, gold)
+                };
+                snapshot.Options.Add(option);
+            }
         }
 
         snapshot.Options = snapshot.Options
+            .GroupBy(static option => string.Join("->", option.PathCoords.Select(static c => $"{c.Row},{c.Col}")), StringComparer.Ordinal)
+            .Select(static group => group
+                .OrderByDescending(static option => option.Score)
+                .ThenBy(static option => option.Coord.Row)
+                .ThenBy(static option => option.Coord.Col)
+                .First())
             .OrderByDescending(static o => o.Score)
             .ThenBy(static o => o.Coord.Row)
             .ThenBy(static o => o.Coord.Col)
+            .Take(256)
             .ToList();
         snapshot.Suggested = snapshot.Options.FirstOrDefault();
         return snapshot;
+    }
+
+    private static List<RouteReachableTypeSnapshot> BuildReachableRouteTypeCounts(IRunState runState)
+    {
+        Dictionary<string, int> counts = new(StringComparer.OrdinalIgnoreCase);
+        HashSet<MapPoint> visited = new();
+        Stack<MapPoint> stack = new(GetNextRouteChoices(runState));
+
+        while (stack.Count > 0)
+        {
+            MapPoint point = stack.Pop();
+            if (!visited.Add(point))
+            {
+                continue;
+            }
+
+            string typeKey = NormalizeRouteTypeKey(point.PointType.ToString());
+            counts.TryGetValue(typeKey, out int current);
+            counts[typeKey] = current + 1;
+
+            foreach (MapPoint child in point.Children)
+            {
+                stack.Push(child);
+            }
+        }
+
+        string[] preferredOrder = new[]
+        {
+            "monster",
+            "elite",
+            "question",
+            "shop",
+            "rest",
+            "treasure",
+            "ancient",
+            "boss"
+        };
+
+        List<RouteReachableTypeSnapshot> rows = preferredOrder
+            .Select(typeKey => new RouteReachableTypeSnapshot
+            {
+                TypeKey = typeKey,
+                Label = RouteTypeKeyToLabel(typeKey),
+                Count = counts.TryGetValue(typeKey, out int count) ? count : 0
+            })
+            .ToList();
+
+        foreach ((string key, int count) in counts.OrderBy(static x => x.Key, StringComparer.Ordinal))
+        {
+            if (preferredOrder.Contains(key, StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            rows.Add(new RouteReachableTypeSnapshot
+            {
+                TypeKey = key,
+                Label = RouteTypeKeyToLabel(key),
+                Count = count
+            });
+        }
+
+        return rows;
+    }
+
+    private static MapCoord? ResolveRouteStartCoord(IRunState runState)
+    {
+        if (runState.CurrentMapCoord.HasValue)
+        {
+            return runState.CurrentMapCoord.Value;
+        }
+
+        if (runState.CurrentMapPoint != null)
+        {
+            return runState.CurrentMapPoint.coord;
+        }
+
+        MapPoint? startingMapPoint = runState.Map?.StartingMapPoint;
+        if (startingMapPoint != null)
+        {
+            return startingMapPoint.coord;
+        }
+
+        return null;
+    }
+
+    private static void TryLogRoutePlanDebug(CombatState state, RunContextSnapshot runContext, RoutePlanSnapshot routePlan)
+    {
+        DateTime utcNow = DateTime.UtcNow;
+        if (utcNow - _lastRouteDebugUtc < RouteDebugInterval)
+        {
+            return;
+        }
+
+        _lastRouteDebugUtc = utcNow;
+        string currentCoord = runContext.CurrentMapCoord == null
+            ? "null"
+            : $"{runContext.CurrentMapCoord.Row},{runContext.CurrentMapCoord.Col}";
+
+        SafeLog(
+            "RouteDebug: "
+            + "inCombat=" + CombatManager.Instance.IsInProgress
+            + " hasMapContext=" + routePlan.HasMapContext
+            + " floor=" + routePlan.CurrentFloor.ToString(CultureInfo.InvariantCulture)
+            + " currentCoord=" + currentCoord
+            + " currentPointType=" + (runContext.CurrentMapPointType ?? "null")
+            + " nextChoices=" + runContext.NextMapChoices.Count.ToString(CultureInfo.InvariantCulture)
+            + " options=" + routePlan.Options.Count.ToString(CultureInfo.InvariantCulture)
+            + " suggested=" + (routePlan.Suggested?.PointTypeLabel ?? "null"));
+
+        if (runContext.NextMapChoices.Count > 0)
+        {
+            string nextChoices = string.Join(
+                " | ",
+                runContext.NextMapChoices.Take(6).Select(static choice =>
+                    $"{choice.Coord.Row},{choice.Coord.Col}:{choice.PointType}"));
+            SafeLog("RouteDebug.NextChoices: " + nextChoices);
+        }
+
+        if (routePlan.Options.Count == 0)
+        {
+            SafeLog("RouteDebug.Options: empty");
+            return;
+        }
+
+        for (int i = 0; i < Math.Min(routePlan.Options.Count, 6); i++)
+        {
+            RouteOptionSnapshot option = routePlan.Options[i];
+            string pathKeys = option.PathTypeKeys == null || option.PathTypeKeys.Count == 0
+                ? "<empty>"
+                : string.Join(",", option.PathTypeKeys.Take(10));
+            string pathCoords = option.PathCoords == null || option.PathCoords.Count == 0
+                ? "<empty>"
+                : string.Join(" -> ", option.PathCoords.Take(12).Select(static c => $"{c.Row},{c.Col}"));
+
+            SafeLog(
+                "RouteDebug.Option[" + i.ToString(CultureInfo.InvariantCulture) + "]: "
+                + "type=" + option.PointType
+                + "/" + option.PointTypeLabel
+                + " score=" + option.Score.ToString("F3", CultureInfo.InvariantCulture)
+                + " risk=" + option.RiskTag
+                + " keys=" + pathKeys
+                + " coords=" + pathCoords);
+        }
+    }
+
+    private static List<MapCoordSnapshot> BuildRoutePathCoords(
+        IRunState runState,
+        MapCoord? currentMapCoord,
+        List<MapCoordSnapshot>? evaluatedPathCoords,
+        MapCoord childCoord)
+    {
+        List<MapCoordSnapshot> route = (evaluatedPathCoords ?? new List<MapCoordSnapshot>())
+            .Where(static c => c != null)
+            .Select(static c => new MapCoordSnapshot
+            {
+                Col = c.Col,
+                Row = c.Row
+            })
+            .ToList();
+
+        if (route.Count == 0)
+        {
+            route.Add(new MapCoordSnapshot
+            {
+                Col = childCoord.col,
+                Row = childCoord.row
+            });
+        }
+
+        if (currentMapCoord != null)
+        {
+            MapCoord currentMapCoordValue = currentMapCoord.Value;
+            if (ShouldIncludeRouteStartPoint(runState, currentMapCoordValue))
+            {
+                MapCoordSnapshot current = new()
+                {
+                    Col = currentMapCoordValue.col,
+                    Row = currentMapCoordValue.row
+                };
+                MapCoordSnapshot first = route[0];
+                if (first.Col != current.Col || first.Row != current.Row)
+                {
+                    route.Insert(0, current);
+                }
+            }
+        }
+
+        return route;
+    }
+
+    private static bool ShouldIncludeRouteStartPoint(IRunState runState, MapCoord currentMapCoord)
+    {
+        MapPoint? currentMapPoint = runState.CurrentMapPoint;
+        if (currentMapPoint == null)
+        {
+            return false;
+        }
+
+        string typeKey = NormalizeRouteTypeKey(currentMapPoint.PointType.ToString());
+        if (string.Equals(typeKey, "unassigned", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(typeKey, "unknown", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return currentMapCoord.row > 0;
     }
 
     private static RouteHistoryStatsSnapshot BuildRouteHistoryStats(IRunState runState, Player? localPlayer)
@@ -2349,6 +3580,11 @@ public static class ProbeModEntry
     private static string NormalizeRouteTypeKey(string pointType)
     {
         string lower = pointType.ToLowerInvariant();
+        if (lower.Contains("ancient", StringComparison.Ordinal))
+        {
+            return "ancient";
+        }
+
         if (lower.Contains("elite", StringComparison.Ordinal))
         {
             return "elite";
@@ -2395,7 +3631,8 @@ public static class ProbeModEntry
 
     private static string RouteTypeKeyToLabel(string routeTypeKey)
     {
-        return routeTypeKey switch
+        string key = routeTypeKey.Trim().ToLowerInvariant();
+        return key switch
         {
             "elite" => "精英",
             "question" => "问号",
@@ -2403,44 +3640,64 @@ public static class ProbeModEntry
             "rest" => "休息",
             "shop" => "商店",
             "treasure" => "宝箱",
-            "boss" => "Boss",
-            _ => routeTypeKey
+            "boss" => "首领",
+            "ancient" => "古遗迹",
+            "unknown" => "未知",
+            "unassigned" => "未定",
+            _ => key
         };
     }
 
-    private static RouteEval EvaluateRoute(MapPoint point, int depth, double hpRatio, int gold)
+    private static List<RouteEval> EvaluateRoutes(MapPoint point, double hpRatio, int gold)
     {
         string pointType = point.PointType.ToString();
+        string typeKey = NormalizeRouteTypeKey(pointType);
         double ownScore = ScoreMapPointType(pointType, hpRatio, gold);
         RouteEval current = new()
         {
             Score = ownScore,
-            PathTypes = new List<string> { pointType }
+            PathTypes = new List<string> { RouteTypeKeyToLabel(typeKey) },
+            PathTypeKeys = new List<string> { typeKey },
+            PathCoords = new List<MapCoordSnapshot>
+            {
+                new()
+                {
+                    Col = point.coord.col,
+                    Row = point.coord.row
+                }
+            }
         };
 
-        if (depth >= RoutePlanDepth || point.Children.Count == 0)
+        if (point.Children.Count == 0)
         {
-            return current;
+            return new List<RouteEval> { current };
         }
 
-        RouteEval? bestChild = null;
+        List<RouteEval> routes = new();
         foreach (MapPoint child in point.Children)
         {
-            RouteEval candidate = EvaluateRoute(child, depth + 1, hpRatio, gold);
-            if (bestChild == null || candidate.Score > bestChild.Score)
+            foreach (RouteEval childRoute in EvaluateRoutes(child, hpRatio, gold))
             {
-                bestChild = candidate;
+                RouteEval combined = new()
+                {
+                    Score = ownScore + childRoute.Score * 0.82,
+                    PathTypes = new List<string>(current.PathTypes),
+                    PathTypeKeys = new List<string>(current.PathTypeKeys),
+                    PathCoords = new List<MapCoordSnapshot>(current.PathCoords)
+                };
+                combined.PathTypes.AddRange(childRoute.PathTypes);
+                combined.PathTypeKeys.AddRange(childRoute.PathTypeKeys);
+                combined.PathCoords.AddRange(childRoute.PathCoords);
+                routes.Add(combined);
             }
         }
 
-        if (bestChild == null)
+        if (routes.Count == 0)
         {
-            return current;
+            routes.Add(current);
         }
 
-        current.Score = ownScore + bestChild.Score * 0.82;
-        current.PathTypes.AddRange(bestChild.PathTypes);
-        return current;
+        return routes;
     }
 
     private static double ScoreMapPointType(string pointType, double hpRatio, int gold)
@@ -2488,15 +3745,15 @@ public static class ProbeModEntry
     {
         if (hpRatio < 0.4)
         {
-            return "survival";
+            return "保守生存";
         }
 
         if (gold >= 200)
         {
-            return "economy";
+            return "经济发育";
         }
 
-        return "balanced";
+        return "均衡推进";
     }
 
     private static string BuildRiskTag(string pointType, double hpRatio)
@@ -2504,20 +3761,20 @@ public static class ProbeModEntry
         string lower = pointType.ToLowerInvariant();
         if (lower.Contains("elite", StringComparison.Ordinal))
         {
-            return hpRatio < 0.6 ? "high" : "medium";
+            return hpRatio < 0.6 ? "高风险" : "中风险";
         }
 
         if (lower.Contains("boss", StringComparison.Ordinal))
         {
-            return hpRatio < 0.55 ? "high" : "medium";
+            return hpRatio < 0.55 ? "高风险" : "中风险";
         }
 
         if (lower.Contains("rest", StringComparison.Ordinal) || lower.Contains("camp", StringComparison.Ordinal))
         {
-            return "low";
+            return "低风险";
         }
 
-        return "medium";
+        return "中风险";
     }
 
     private static List<string> BuildRouteReasons(string pointType, double hpRatio, int gold)
@@ -2570,6 +3827,139 @@ public static class ProbeModEntry
         }
 
         return numerator / denominator;
+    }
+
+    private static List<OverlayModifierCatalogEntry> BuildModifierCardCatalog()
+    {
+        return ModelDb.AllCards
+            .OrderBy(static card => card.Id.Entry, StringComparer.Ordinal)
+            .Select(static card => new OverlayModifierCatalogEntry
+            {
+                Id = card.Id.Entry,
+                Title = SafeText(() => card.Title, card.Id.Entry),
+                Subtitle = card.Type + " / " + card.Rarity
+            })
+            .ToList();
+    }
+
+    private static List<OverlayModifierCatalogEntry> BuildModifierRelicCatalog()
+    {
+        return ModelDb.AllRelics
+            .OrderBy(static relic => relic.Id.Entry, StringComparer.Ordinal)
+            .Select(static relic => new OverlayModifierCatalogEntry
+            {
+                Id = relic.Id.Entry,
+                Title = SafeText(() => relic.Title.GetFormattedText(), relic.Id.Entry),
+                Subtitle = relic.Rarity.ToString()
+            })
+            .ToList();
+    }
+
+    private static async Task ExecuteModifierActionAsync(string action, Func<Player, Task<string>> executor)
+    {
+        try
+        {
+            Player? player = ResolveCurrentLocalPlayer();
+            if (player == null)
+            {
+                throw new InvalidOperationException("当前未找到本地玩家。");
+            }
+
+            string result = await executor(player);
+            SafeLog("[Modifier] " + action + " ok: " + result);
+            WriteStatus("modifier_ok", result);
+            RefreshAfterModifierAction(action);
+        }
+        catch (Exception ex)
+        {
+            SafeLog("[Modifier] " + action + " failed: " + ex);
+            WriteStatus("modifier_error", ex.Message);
+        }
+    }
+
+    private static void RefreshAfterModifierAction(string reason)
+    {
+        _lastDumpUtc = DateTime.MinValue;
+        TryDumpFromTrackedState("modifier_" + reason);
+    }
+
+    private static Player? ResolveCurrentLocalPlayer()
+    {
+        try
+        {
+            CombatStateTracker? tracker = CombatManager.Instance?.StateTracker;
+            if (tracker != null &&
+                CombatTrackerStateField != null &&
+                CombatTrackerStateField.GetValue(tracker) is CombatState trackedState)
+            {
+                Player? combatPlayer = LocalContext.GetMe(trackedState);
+                if (combatPlayer != null)
+                {
+                    return combatPlayer;
+                }
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        RunState? runState = ResolveCurrentRunState();
+        return runState == null ? null : ResolveLocalPlayer(runState);
+    }
+
+    private static Player? ResolveLocalPlayer(IRunState runState)
+    {
+        try
+        {
+            Player? localPlayer = LocalContext.GetMe(runState.Players);
+            if (localPlayer != null)
+            {
+                return localPlayer;
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        return runState.Players.FirstOrDefault();
+    }
+
+    private static RunState? ResolveCurrentRunState()
+    {
+        try
+        {
+            CombatStateTracker? tracker = CombatManager.Instance?.StateTracker;
+            if (tracker != null &&
+                CombatTrackerStateField != null &&
+                CombatTrackerStateField.GetValue(tracker) is CombatState trackedState &&
+                trackedState.RunState is RunState combatRunState)
+            {
+                return combatRunState;
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        try
+        {
+            RunManager? runManager = RunManager.Instance;
+            if (runManager != null &&
+                RunManagerStateField != null &&
+                RunManagerStateField.GetValue(runManager) is RunState runState)
+            {
+                return runState;
+            }
+        }
+        catch
+        {
+            // Ignore.
+        }
+
+        return null;
     }
 
     private static void WriteStatus(string phase, string message)
@@ -2982,6 +4372,8 @@ public static class ProbeModEntry
         public List<CombatLogLineSnapshot> RecentCombatLog { get; set; } = new();
         public AnalyticsHighlightsSnapshot Highlights { get; set; } = new();
         public RouteHistoryStatsSnapshot RouteHistory { get; set; } = new();
+        public List<PlayerContributionSnapshot> CurrentContributionBoard { get; set; } = new();
+        public List<PlayerContributionSnapshot> TotalContributionBoard { get; set; } = new();
     }
 
     private sealed class ModeMetricsSnapshot
@@ -3014,11 +4406,30 @@ public static class ProbeModEntry
         public int CardsPlayed { get; set; }
         public int BuffsApplied { get; set; }
         public int DebuffsApplied { get; set; }
+        public int UniqueBuffKinds { get; set; }
+        public int UniqueDebuffKinds { get; set; }
         public double DamagePerEnergy { get; set; }
         public int TempoScore { get; set; }
+        public double StatusScore { get; set; }
         public List<CardMetricSnapshot> TopCards { get; set; } = new();
         public List<PowerCountSnapshot> TopBuffs { get; set; } = new();
         public List<PowerCountSnapshot> TopDebuffs { get; set; } = new();
+    }
+
+    private sealed class PlayerContributionSnapshot
+    {
+        public ulong NetId { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public double ContributionScore { get; set; }
+        public double Ndps { get; set; }
+        public double SupportDamage { get; set; }
+        public double Mitigation { get; set; }
+        public double TeamBlock { get; set; }
+        public double StatusScore { get; set; }
+        public int StatusApplications { get; set; }
+        public int OffensiveDebuffsApplied { get; set; }
+        public int DefensiveBuffsApplied { get; set; }
+        public double Ratio { get; set; }
     }
 
     private sealed class CardMetricSnapshot
@@ -3072,10 +4483,19 @@ public static class ProbeModEntry
         public bool HasMapContext { get; set; }
         public double HpRatio { get; set; }
         public string Strategy { get; set; } = "balanced";
+        public int ReachableNodeCount { get; set; }
+        public List<RouteReachableTypeSnapshot> ReachableByType { get; set; } = new();
         public RouteHistoryStatsSnapshot HistoricalStats { get; set; } = new();
         public List<string> Insights { get; set; } = new();
         public RouteOptionSnapshot? Suggested { get; set; }
         public List<RouteOptionSnapshot> Options { get; set; } = new();
+    }
+
+    private sealed class RouteReachableTypeSnapshot
+    {
+        public string TypeKey { get; set; } = string.Empty;
+        public string Label { get; set; } = string.Empty;
+        public int Count { get; set; }
     }
 
     private sealed class RouteHistoryStatsSnapshot
@@ -3127,8 +4547,11 @@ public static class ProbeModEntry
     {
         public MapCoordSnapshot Coord { get; set; } = new();
         public string PointType { get; set; } = string.Empty;
+        public string PointTypeLabel { get; set; } = string.Empty;
         public double Score { get; set; }
         public string RiskTag { get; set; } = string.Empty;
+        public List<string> PathTypeKeys { get; set; } = new();
+        public List<MapCoordSnapshot> PathCoords { get; set; } = new();
         public List<string> PathPreview { get; set; } = new();
         public List<string> Reasons { get; set; } = new();
     }
@@ -3156,6 +4579,66 @@ public static class ProbeModEntry
     {
         public double Score { get; set; }
         public List<string> PathTypes { get; set; } = new();
+        public List<string> PathTypeKeys { get; set; } = new();
+        public List<MapCoordSnapshot> PathCoords { get; set; } = new();
+    }
+
+    private sealed class PowerSourceKey : IEquatable<PowerSourceKey>
+    {
+        public uint ReceiverCombatId { get; init; }
+        public string PowerId { get; init; } = string.Empty;
+
+        public bool Equals(PowerSourceKey? other)
+        {
+            if (other == null)
+            {
+                return false;
+            }
+
+            return ReceiverCombatId == other.ReceiverCombatId
+                && string.Equals(PowerId, other.PowerId, StringComparison.Ordinal);
+        }
+
+        public override bool Equals(object? obj)
+        {
+            return Equals(obj as PowerSourceKey);
+        }
+
+        public override int GetHashCode()
+        {
+            return HashCode.Combine(ReceiverCombatId, PowerId);
+        }
+    }
+
+    private sealed class PowerSourceRecord
+    {
+        public uint? ApplierCombatId { get; set; }
+        public ulong? ApplierNetId { get; set; }
+        public string ApplierName { get; set; } = string.Empty;
+        public DateTime UpdatedUtc { get; set; }
+    }
+
+    private sealed class ContributionAccumulator
+    {
+        public ulong NetId { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public double Ndps { get; set; }
+        public double SupportDamage { get; set; }
+        public double Mitigation { get; set; }
+        public double TeamBlock { get; set; }
+        public int StatusApplications { get; set; }
+        public int OffensiveDebuffsApplied { get; set; }
+        public int DefensiveBuffsApplied { get; set; }
+    }
+
+    private sealed class ResolvedPowerModifier
+    {
+        public uint OwnerCombatId { get; set; }
+        public uint? ApplierCombatId { get; set; }
+        public ulong? ApplierNetId { get; set; }
+        public string ApplierName { get; set; } = string.Empty;
+        public string PowerId { get; set; } = string.Empty;
+        public double Multiplier { get; set; }
     }
 
     private sealed class DictionarySnapshot

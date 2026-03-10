@@ -10,7 +10,7 @@
 ## 2. 文件总览
 
 - `state.json`: 主状态（玩家/敌人/手牌/动作空间/战斗历史/路线建议）
-- `analytics.json`: 统计指标（当前战斗+总计+单机/联机拆分）
+- `analytics.json`: 统计指标（当前战斗+总计+单机/联机拆分 + 团队贡献榜）
 - `dashboard.json`: 一屏汇总（适合 UI 展示）
 - `dictionary.json`: 英文稳定 ID -> 当前语言文本
 - `status.json`: Mod 状态与错误信息
@@ -68,6 +68,7 @@
 
 展示增强：
 - `analytics.CurrentCombat / Total / Singleplayer / Multiplayer`
+- `analytics.CurrentContributionBoard[]`（贡献分、直伤、辅伤、减伤、团队护盾、状态分）
 - `dashboard.Summary / Alerts / FunInsights`
 
 文本本地化：
