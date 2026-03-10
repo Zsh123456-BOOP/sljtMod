@@ -900,13 +900,14 @@ internal sealed class ProbeOverlayNode : PanelContainer
     private HFlowContainer _routeLegendRows = null!;
     private VBoxContainer _routeOptionRows = null!;
     private Label _modifierStatsLabel = null!;
-    private SpinBox _modifierHpSpin = null!;
-    private SpinBox _modifierGoldSpin = null!;
+    private LineEdit _modifierHpInput = null!;
+    private LineEdit _modifierGoldInput = null!;
     private LineEdit _modifierRelicSearch = null!;
     private ItemList _modifierRelicList = null!;
     private LineEdit _modifierCardSearch = null!;
     private ItemList _modifierCardList = null!;
     private ItemList _modifierDeckList = null!;
+    private ScrollContainer _modifierScroll = null!;
     private MarginContainer _contentContainer = null!;
     private Control _resizeLayer = null!;
     private PanelContainer _dragBar = null!;
@@ -1288,9 +1289,19 @@ internal sealed class ProbeOverlayNode : PanelContainer
         _modifierContainer.AddThemeConstantOverride("margin_bottom", 2);
         body.AddChild(_modifierContainer);
 
+        _modifierScroll = new ScrollContainer
+        {
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            CustomMinimumSize = new Vector2(0, 260),
+            HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled
+        };
+        _modifierContainer.AddChild(_modifierScroll);
+
         VBoxContainer modifierRoot = new();
         modifierRoot.AddThemeConstantOverride("separation", 6);
-        _modifierContainer.AddChild(modifierRoot);
+        modifierRoot.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        _modifierScroll.AddChild(modifierRoot);
 
         _modifierStatsLabel = new Label
         {
@@ -1490,19 +1501,21 @@ internal sealed class ProbeOverlayNode : PanelContainer
         _contentContainer.Visible = !_collapsed;
         _collapseButton.Text = _collapsed ? "□" : "—";
         UpdateOpacityLabel();
+        Vector2 dynamicMax = GetDynamicMaxPanelSize();
         CustomMinimumSize = _collapsed
             ? new Vector2(MinPanelWidth, CollapsedHeight)
             : new Vector2(MinPanelWidth, MinPanelHeight);
         if (_collapsed)
         {
-            Size = new Vector2(Mathf.Clamp(Size.X, MinPanelWidth, MaxPanelWidth), CollapsedHeight);
+            Size = new Vector2(Mathf.Clamp(Size.X, MinPanelWidth, dynamicMax.X), CollapsedHeight);
         }
         else
         {
             Size = new Vector2(
-                Mathf.Clamp(Size.X, MinPanelWidth, MaxPanelWidth),
-                Mathf.Clamp(Size.Y, MinPanelHeight, MaxPanelHeight));
+                Mathf.Clamp(Size.X, MinPanelWidth, dynamicMax.X),
+                Mathf.Clamp(Size.Y, MinPanelHeight, dynamicMax.Y));
         }
+        UpdateModifierViewportSizing();
         UpdateResizeHandlePlacement();
 
         TooltipText = "更新时间: " + _payload.TimestampUtc;
@@ -1637,22 +1650,25 @@ internal sealed class ProbeOverlayNode : PanelContainer
         hpLabel.CustomMinimumSize = new Vector2(48, 0);
         hpRow.AddChild(hpLabel);
 
-        _modifierHpSpin = new SpinBox
+        _modifierHpInput = new LineEdit
         {
-            MinValue = 0,
-            MaxValue = 9999,
-            Step = 1,
-            Rounded = true,
+            PlaceholderText = "输入生命值",
             SizeFlagsHorizontal = SizeFlags.ExpandFill
         };
-        hpRow.AddChild(_modifierHpSpin);
+        hpRow.AddChild(_modifierHpInput);
 
         Button hpApply = new()
         {
             Text = "设置生命",
             FocusMode = FocusModeEnum.None
         };
-        hpApply.Pressed += () => ProbeModEntry.SetCurrentLocalPlayerHp((int)_modifierHpSpin.Value);
+        hpApply.Pressed += () =>
+        {
+            if (TryParseModifierInput(_modifierHpInput, out int value))
+            {
+                ProbeModEntry.SetCurrentLocalPlayerHp(value);
+            }
+        };
         hpRow.AddChild(hpApply);
 
         HBoxContainer goldRow = new();
@@ -1663,22 +1679,25 @@ internal sealed class ProbeOverlayNode : PanelContainer
         goldLabel.CustomMinimumSize = new Vector2(48, 0);
         goldRow.AddChild(goldLabel);
 
-        _modifierGoldSpin = new SpinBox
+        _modifierGoldInput = new LineEdit
         {
-            MinValue = 0,
-            MaxValue = 999999,
-            Step = 1,
-            Rounded = true,
+            PlaceholderText = "输入金币数量",
             SizeFlagsHorizontal = SizeFlags.ExpandFill
         };
-        goldRow.AddChild(_modifierGoldSpin);
+        goldRow.AddChild(_modifierGoldInput);
 
         Button goldApply = new()
         {
             Text = "设置金币",
             FocusMode = FocusModeEnum.None
         };
-        goldApply.Pressed += () => ProbeModEntry.SetCurrentLocalPlayerGold((int)_modifierGoldSpin.Value);
+        goldApply.Pressed += () =>
+        {
+            if (TryParseModifierInput(_modifierGoldInput, out int value))
+            {
+                ProbeModEntry.SetCurrentLocalPlayerGold(value);
+            }
+        };
         goldRow.AddChild(goldApply);
 
         return panel;
@@ -1848,9 +1867,15 @@ internal sealed class ProbeOverlayNode : PanelContainer
             ? "当前未识别到本地玩家。"
             : $"玩家 {state.PlayerName} | 角色 {state.CharacterId} | 生命 {state.CurrentHp}/{state.MaxHp} | 金币 {state.Gold} | 遗物 {state.RelicCount} | 牌库 {state.DeckCount}";
 
-        _modifierHpSpin.MaxValue = Math.Max(1, state.MaxHp);
-        _modifierHpSpin.Value = Math.Clamp(state.CurrentHp, 0, (int)_modifierHpSpin.MaxValue);
-        _modifierGoldSpin.Value = Math.Max(0, state.Gold);
+        if (!string.Equals(_modifierHpInput.Text, state.CurrentHp.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+        {
+            _modifierHpInput.Text = state.CurrentHp.ToString(CultureInfo.InvariantCulture);
+        }
+
+        if (!string.Equals(_modifierGoldInput.Text, state.Gold.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal))
+        {
+            _modifierGoldInput.Text = state.Gold.ToString(CultureInfo.InvariantCulture);
+        }
 
         RefreshModifierRelicList();
         RefreshModifierCardCatalog();
@@ -1918,6 +1943,13 @@ internal sealed class ProbeOverlayNode : PanelContainer
 
         Variant metadata = list.GetItemMetadata(selected[0]);
         return metadata.VariantType == Variant.Type.Nil ? null : metadata.AsString();
+    }
+
+    private static bool TryParseModifierInput(LineEdit input, out int value)
+    {
+        value = 0;
+        string text = input.Text?.Trim() ?? string.Empty;
+        return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
     }
 
     private static Control CreatePlaceholderRow(string text)
@@ -2297,6 +2329,7 @@ internal sealed class ProbeOverlayNode : PanelContainer
         float oldHeight = _resizeStartSize.Y;
         float newX = _resizeStartPosition.X;
         float newY = _resizeStartPosition.Y;
+        Vector2 dynamicMax = GetDynamicMaxPanelSize();
 
         float newWidth = oldWidth;
         float minHeight = _collapsed ? CollapsedHeight : MinPanelHeight;
@@ -2306,42 +2339,42 @@ internal sealed class ProbeOverlayNode : PanelContainer
         {
             case ResizeCorner.TopLeft:
             {
-                newWidth = Mathf.Clamp(oldWidth - delta.X, MinPanelWidth, MaxPanelWidth);
+                newWidth = Mathf.Clamp(oldWidth - delta.X, MinPanelWidth, dynamicMax.X);
                 newX = _resizeStartPosition.X + (oldWidth - newWidth);
                 if (!_collapsed)
                 {
-                    newHeight = Mathf.Clamp(oldHeight - delta.Y, minHeight, MaxPanelHeight);
+                    newHeight = Mathf.Clamp(oldHeight - delta.Y, minHeight, dynamicMax.Y);
                     newY = _resizeStartPosition.Y + (oldHeight - newHeight);
                 }
                 break;
             }
             case ResizeCorner.TopRight:
             {
-                newWidth = Mathf.Clamp(oldWidth + delta.X, MinPanelWidth, MaxPanelWidth);
+                newWidth = Mathf.Clamp(oldWidth + delta.X, MinPanelWidth, dynamicMax.X);
                 if (!_collapsed)
                 {
-                    newHeight = Mathf.Clamp(oldHeight - delta.Y, minHeight, MaxPanelHeight);
+                    newHeight = Mathf.Clamp(oldHeight - delta.Y, minHeight, dynamicMax.Y);
                     newY = _resizeStartPosition.Y + (oldHeight - newHeight);
                 }
                 break;
             }
             case ResizeCorner.BottomLeft:
             {
-                newWidth = Mathf.Clamp(oldWidth - delta.X, MinPanelWidth, MaxPanelWidth);
+                newWidth = Mathf.Clamp(oldWidth - delta.X, MinPanelWidth, dynamicMax.X);
                 newX = _resizeStartPosition.X + (oldWidth - newWidth);
                 if (!_collapsed)
                 {
-                    newHeight = Mathf.Clamp(oldHeight + delta.Y, minHeight, MaxPanelHeight);
+                    newHeight = Mathf.Clamp(oldHeight + delta.Y, minHeight, dynamicMax.Y);
                 }
                 break;
             }
             case ResizeCorner.BottomRight:
             default:
             {
-                newWidth = Mathf.Clamp(oldWidth + delta.X, MinPanelWidth, MaxPanelWidth);
+                newWidth = Mathf.Clamp(oldWidth + delta.X, MinPanelWidth, dynamicMax.X);
                 if (!_collapsed)
                 {
-                    newHeight = Mathf.Clamp(oldHeight + delta.Y, minHeight, MaxPanelHeight);
+                    newHeight = Mathf.Clamp(oldHeight + delta.Y, minHeight, dynamicMax.Y);
                 }
                 break;
             }
@@ -2361,7 +2394,42 @@ internal sealed class ProbeOverlayNode : PanelContainer
 
         Position = new Vector2(newX, newY);
         Size = new Vector2(newWidth, newHeight);
+        UpdateModifierViewportSizing();
         UpdateResizeHandlePlacement();
+    }
+
+    private Vector2 GetDynamicMaxPanelSize()
+    {
+        Rect2 viewportRect = GetViewportRect();
+        float maxWidth = Mathf.Clamp(viewportRect.Size.X - 8, MinPanelWidth, MaxPanelWidth);
+        float maxHeight = Mathf.Clamp(viewportRect.Size.Y - 8, MinPanelHeight, MaxPanelHeight);
+        return new Vector2(maxWidth, maxHeight);
+    }
+
+    private void UpdateModifierViewportSizing()
+    {
+        if (_modifierScroll == null || !GodotObject.IsInstanceValid(_modifierScroll))
+        {
+            return;
+        }
+
+        float bodyHeight = Mathf.Max(180f, Size.Y - 118f);
+        _modifierScroll.CustomMinimumSize = new Vector2(0, bodyHeight);
+
+        if (_modifierRelicList != null && GodotObject.IsInstanceValid(_modifierRelicList))
+        {
+            _modifierRelicList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.28f, 96f, 180f));
+        }
+
+        if (_modifierCardList != null && GodotObject.IsInstanceValid(_modifierCardList))
+        {
+            _modifierCardList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.28f, 96f, 180f));
+        }
+
+        if (_modifierDeckList != null && GodotObject.IsInstanceValid(_modifierDeckList))
+        {
+            _modifierDeckList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.30f, 110f, 200f));
+        }
     }
 
     private void UpdateResizeHandlePlacement()

@@ -2810,6 +2810,10 @@ public static class ProbeModEntry
             {
                 int value = Math.Clamp(hp, 0, player.Creature.MaxHp);
                 await CreatureCmd.SetCurrentHp(player.Creature, value);
+                if (player.Creature.CurrentHp != value)
+                {
+                    player.Creature.SetCurrentHpInternal(value);
+                }
                 return $"当前生命已设置为 {value}/{player.Creature.MaxHp}";
             });
     }
@@ -2822,6 +2826,10 @@ public static class ProbeModEntry
             {
                 int value = Math.Max(0, gold);
                 await PlayerCmd.SetGold(value, player);
+                if (player.Gold != value)
+                {
+                    player.Gold = value;
+                }
                 return $"金币已设置为 {value}";
             });
     }
