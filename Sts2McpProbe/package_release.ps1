@@ -44,9 +44,11 @@ if (Test-Path $stageDir) {
     Remove-Item $stageDir -Recurse -Force
 }
 New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $stageDir "PckRoot") -Force | Out-Null
 
 Copy-Item $dllSource (Join-Path $stageDir "Sts2Mcp.dll") -Force
 Copy-Item $pckSource (Join-Path $stageDir "Sts2Mcp.pck") -Force
+Copy-Item (Join-Path $projectDir "PckRoot\\mod_manifest.json") (Join-Path $stageDir "PckRoot\\mod_manifest.json") -Force
 Copy-Item (Join-Path $projectDir "tools\InstallerCommon.ps1") (Join-Path $stageDir "InstallerCommon.ps1") -Force
 Copy-Item (Join-Path $projectDir "tools\Install-Sts2Mcp.ps1") (Join-Path $stageDir "Install-Sts2Mcp.ps1") -Force
 Copy-Item (Join-Path $projectDir "tools\Uninstall-Sts2Mcp.ps1") (Join-Path $stageDir "Uninstall-Sts2Mcp.ps1") -Force

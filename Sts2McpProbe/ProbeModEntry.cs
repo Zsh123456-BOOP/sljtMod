@@ -3,6 +3,9 @@ using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using GodotCallable = Godot.Callable;
+using GodotSceneTree = Godot.SceneTree;
+using GodotSceneTreeTimer = Godot.SceneTreeTimer;
 using MegaCrit.Sts2.Core.Combat;
 using MegaCrit.Sts2.Core.Combat.History;
 using MegaCrit.Sts2.Core.Combat.History.Entries;
@@ -17,6 +20,7 @@ using MegaCrit.Sts2.Core.Map;
 using MegaCrit.Sts2.Core.Modding;
 using MegaCrit.Sts2.Core.Models;
 using MegaCrit.Sts2.Core.MonsterMoves.Intents;
+using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Rooms;
 using MegaCrit.Sts2.Core.Runs;
 using MegaCrit.Sts2.Core.Runs.History;
@@ -45,6 +49,7 @@ public static class ProbeModEntry
     private static DateTime _lastDictionaryAttemptUtc = DateTime.MinValue;
     private static DateTime _lastRouteDebugUtc = DateTime.MinValue;
     private static bool _hooksInstalled;
+    private static bool _bootstrapTimerStarted;
     private static bool _dictionaryDumped;
     private static bool _wasInCombat;
     private static int _lastProcessedHistoryEntryCount;
@@ -84,44 +89,120 @@ public static class ProbeModEntry
         typeof(RunManager).GetField("<State>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
     private static List<OverlayModifierCatalogEntry>? _cardCatalogCache;
     private static List<OverlayModifierCatalogEntry>? _relicCatalogCache;
-
     public static void Initialize()
     {
-        Directory.CreateDirectory(WorkDir);
-        SafeLog("Initialize() invoked.");
-        WriteStatus("initialized", "Mod initialized successfully.");
-        ProbeOverlayManager.SetLogger(SafeLog);
+        try
+        {
+            Directory.CreateDirectory(WorkDir);
+            SafeLog("Initialize() invoked.");
+            WriteStatus("initialized", "Mod initialized successfully.");
+            ProbeOverlayManager.SetLogger(SafeLog);
+            PushBootstrapOverlay("Mod 已加载，正在等待游戏 UI 与运行时...");
+            TryDumpDictionary(force: true);
+            TryInstallHooks("initialize");
+            EnsureBootstrapTimer();
+        }
+        catch (Exception ex)
+        {
+            SafeLog("Initialize failed: " + ex);
+            WriteStatus("init_error", ex.Message);
+        }
+    }
+
+    private static void EnsureBootstrapTimer()
+    {
+        if (_hooksInstalled || _bootstrapTimerStarted)
+        {
+            return;
+        }
+
+        _bootstrapTimerStarted = true;
+        GodotCallable.From(BootstrapTick).CallDeferred();
+        SafeLog("Bootstrap retry scheduled.");
+    }
+
+    private static void ScheduleBootstrapRetry()
+    {
+        GodotSceneTree? tree = NGame.Instance?.GetTree();
+        if (tree == null)
+        {
+            GodotCallable.From(BootstrapTick).CallDeferred();
+            return;
+        }
+
+        GodotSceneTreeTimer timer = tree.CreateTimer(1.0);
+        timer.Timeout += BootstrapTick;
+    }
+
+    private static void BootstrapTick()
+    {
+        _bootstrapTimerStarted = false;
+        try
+        {
+            if (!TryInstallHooks("bootstrap_timer"))
+            {
+                _bootstrapTimerStarted = true;
+                ScheduleBootstrapRetry();
+                return;
+            }
+
+            TryDumpFromRunManager("bootstrap_timer");
+        }
+        catch (Exception ex)
+        {
+            SafeLog("Bootstrap tick failed: " + ex.Message);
+            _bootstrapTimerStarted = true;
+            ScheduleBootstrapRetry();
+        }
+    }
+
+    private static bool TryInstallHooks(string reason)
+    {
+        if (_hooksInstalled)
+        {
+            return true;
+        }
+
+        CombatManager? combatManager = CombatManager.Instance;
+        RunManager? runManager = RunManager.Instance;
+        CombatStateTracker? stateTracker = combatManager?.StateTracker;
+        if (combatManager == null || runManager == null || stateTracker == null)
+        {
+            SafeLog(
+                "Hook install deferred: reason=" + reason
+                + " combatManager=" + (combatManager != null)
+                + " runManager=" + (runManager != null)
+                + " stateTracker=" + (stateTracker != null));
+            return false;
+        }
+
+        combatManager.CombatSetUp += OnCombatSetUp;
+        combatManager.CombatEnded += OnCombatEnded;
+        stateTracker.CombatStateChanged += OnCombatStateChanged;
+        runManager.RunStarted += OnRunStarted;
+        runManager.ActEntered += OnActEntered;
+        runManager.RoomEntered += OnRoomEntered;
+        runManager.RoomExited += OnRoomExited;
+        _hooksInstalled = true;
+        SafeLog("Hooks installed. reason=" + reason);
+        PushBootstrapOverlay("Mod 已加载，等待战斗数据...");
+        TryDumpFromRunManager("hooks_installed");
+        return true;
+    }
+
+    private static void PushBootstrapOverlay(string summary)
+    {
         ProbeOverlayManager.Update(new OverlayPayload
         {
             TimestampUtc = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture),
             Mode = "singleplayer",
             IsInCombat = false,
-            Summary = "Mod 已加载，等待战斗数据...",
+            Summary = summary,
             CombatPanel = "等待进入战斗...",
             TotalPanel = "等待累计统计...",
             RoutePanel = "等待路线数据...",
             LogsPanel = "等待战斗日志..."
         });
-        InstallHooks();
-        TryDumpDictionary(force: true);
-    }
-
-    private static void InstallHooks()
-    {
-        if (_hooksInstalled)
-        {
-            return;
-        }
-
-        _hooksInstalled = true;
-        CombatManager.Instance.CombatSetUp += OnCombatSetUp;
-        CombatManager.Instance.CombatEnded += OnCombatEnded;
-        CombatManager.Instance.StateTracker.CombatStateChanged += OnCombatStateChanged;
-        RunManager.Instance.RunStarted += OnRunStarted;
-        RunManager.Instance.ActEntered += OnActEntered;
-        RunManager.Instance.RoomEntered += OnRoomEntered;
-        RunManager.Instance.RoomExited += OnRoomExited;
-        SafeLog("Hooks installed.");
     }
 
     private static void OnCombatSetUp(CombatState state)
@@ -1387,11 +1468,7 @@ public static class ProbeModEntry
         {
             StartNewBattle(state, modeKey);
         }
-
-        if (!isInCombat && _wasInCombat)
-        {
-            FinalizeActiveBattle(localPlayer, "combat_ended");
-        }
+        bool combatJustEnded = !isInCombat && _wasInCombat;
 
         if (_activeBattle != null && historyEntries.Count < _lastProcessedHistoryEntryCount)
         {
@@ -1422,7 +1499,13 @@ public static class ProbeModEntry
             _activeBattle.ActFloor = state.RunState.ActFloor;
             _activeBattle.TotalFloor = state.RunState.TotalFloor;
         }
-        else if (!isInCombat)
+
+        if (combatJustEnded)
+        {
+            FinalizeActiveBattle(localPlayer, "combat_ended");
+        }
+
+        if (!isInCombat && _activeBattle == null)
         {
             _lastProcessedHistoryEntryCount = 0;
         }
@@ -1555,6 +1638,17 @@ public static class ProbeModEntry
             Result = result,
             Metrics = BuildMetricsSnapshot(_activeBattle.Stats)
         };
+
+        SafeLog(
+            "FinalizeActiveBattle: "
+            + "combatId=" + segment.CombatId
+            + " result=" + segment.Result
+            + " rounds=" + segment.RoundCount.ToString(CultureInfo.InvariantCulture)
+            + " duration=" + segment.DurationSeconds.ToString(CultureInfo.InvariantCulture) + "s"
+            + " damage=" + segment.Metrics.DamageDealt.ToString(CultureInfo.InvariantCulture)
+            + " taken=" + segment.Metrics.DamageTaken.ToString(CultureInfo.InvariantCulture)
+            + " cards=" + segment.Metrics.CardsPlayed.ToString(CultureInfo.InvariantCulture)
+            + " reason=" + reason);
 
         _battleSegments.Add(segment);
         if (_battleSegments.Count > MaxBattleSegments)
@@ -1959,12 +2053,6 @@ public static class ProbeModEntry
             {
                 return;
             }
-
-            AddContribution(
-                dealerCombatId.Value,
-                modeKey,
-                playersByCombatId,
-                ndps: 0);
 
             List<ResolvedPowerModifier> targetDebuffModifiers = ResolveDynamicDamageMultipliers(
                 damageReceived.Receiver,
@@ -3407,7 +3495,7 @@ public static class ProbeModEntry
             return false;
         }
 
-        return currentMapCoord.row > 0;
+        return true;
     }
 
     private static RouteHistoryStatsSnapshot BuildRouteHistoryStats(IRunState runState, Player? localPlayer)
@@ -3656,8 +3744,9 @@ public static class ProbeModEntry
         };
     }
 
-    private static List<RouteEval> EvaluateRoutes(MapPoint point, double hpRatio, int gold)
+    private static List<RouteEval> EvaluateRoutes(MapPoint point, double hpRatio, int gold, int depth = 0)
     {
+        const int MaxRouteDepth = 12;
         string pointType = point.PointType.ToString();
         string typeKey = NormalizeRouteTypeKey(pointType);
         double ownScore = ScoreMapPointType(pointType, hpRatio, gold);
@@ -3676,7 +3765,7 @@ public static class ProbeModEntry
             }
         };
 
-        if (point.Children.Count == 0)
+        if (point.Children.Count == 0 || depth >= MaxRouteDepth)
         {
             return new List<RouteEval> { current };
         }
@@ -3684,7 +3773,7 @@ public static class ProbeModEntry
         List<RouteEval> routes = new();
         foreach (MapPoint child in point.Children)
         {
-            foreach (RouteEval childRoute in EvaluateRoutes(child, hpRatio, gold))
+            foreach (RouteEval childRoute in EvaluateRoutes(child, hpRatio, gold, depth + 1))
             {
                 RouteEval combined = new()
                 {

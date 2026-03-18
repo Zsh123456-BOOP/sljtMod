@@ -128,8 +128,6 @@ internal static class ProbeOverlayManager
         {
             _overlay.DebugLogger = logger;
         }
-
-        QueueMainThreadFlush();
     }
 
     public static void Update(OverlayPayload payload)
@@ -217,6 +215,23 @@ internal static class ProbeOverlayManager
         }
 
         QueueMainThreadFlush();
+    }
+
+    public static void RefreshRouteHighlight()
+    {
+        bool hasRouteContext;
+        lock (StateLock)
+        {
+            hasRouteContext = _selectedRouteOptionIndex >= 0
+                || _previewRouteOptionIndex >= 0
+                || !string.IsNullOrWhiteSpace(_lockedRouteTypeKey)
+                || !string.IsNullOrWhiteSpace(_previewRouteTypeKey);
+        }
+
+        if (hasRouteContext)
+        {
+            QueueMainThreadFlush(forceDeferred: true);
+        }
     }
 
     public static string? GetLockedRouteTypeKey()
@@ -695,36 +710,31 @@ internal static class OverlayRouteHighlighter
 
         int drawnSegments = 0;
         int missingSegments = 0;
-        for (int i = 0; i < option.PathCoords.Count - 1; i++)
+        List<Vector2> stroke = new();
+        foreach (OverlayRouteCoord coord in option.PathCoords)
         {
-            OverlayRouteCoord start = option.PathCoords[i];
-            OverlayRouteCoord end = option.PathCoords[i + 1];
-            if (!TryGetPointPosition(mapPointDictionary, start, out Vector2 startGlobal)
-                || !TryGetPointPosition(mapPointDictionary, end, out Vector2 endGlobal))
+            if (!TryGetPointPosition(mapPointDictionary, coord, out Vector2 globalPosition))
             {
                 missingSegments++;
                 if (missingSegments <= 4)
                 {
                     logger?.Invoke(
-                        "[Overlay] Route segment skipped (coord miss): "
-                        + start.Row.ToString(CultureInfo.InvariantCulture)
+                        "[Overlay] Route coord skipped (coord miss): "
+                        + coord.Row.ToString(CultureInfo.InvariantCulture)
                         + ","
-                        + start.Col.ToString(CultureInfo.InvariantCulture)
-                        + " -> "
-                        + end.Row.ToString(CultureInfo.InvariantCulture)
-                        + ","
-                        + end.Col.ToString(CultureInfo.InvariantCulture));
+                        + coord.Col.ToString(CultureInfo.InvariantCulture));
                 }
+
+                DrawStrokeIfPossible(drawings, stroke, ref drawnSegments);
+                stroke.Clear();
                 continue;
             }
 
-            Vector2 startLocal = drawings.GetGlobalTransform().Inverse() * startGlobal;
-            Vector2 endLocal = drawings.GetGlobalTransform().Inverse() * endGlobal;
-            drawings.BeginLineLocal(startLocal, DrawingMode.Drawing);
-            drawings.UpdateCurrentLinePositionLocal(endLocal);
-            drawings.StopLineLocal();
-            drawnSegments++;
+            Vector2 localPosition = drawings.GetGlobalTransform().Inverse() * globalPosition;
+            stroke.Add(localPosition);
         }
+
+        DrawStrokeIfPossible(drawings, stroke, ref drawnSegments);
 
         if (drawnSegments <= 0)
         {
@@ -828,12 +838,8 @@ internal static class OverlayRouteHighlighter
         MapCoord mapCoord = new(coord.Col, coord.Row);
         if (!mapPointDictionary.TryGetValue(mapCoord, out NMapPoint? mapPoint))
         {
-            MapCoord swapped = new(coord.Row, coord.Col);
-            if (!mapPointDictionary.TryGetValue(swapped, out mapPoint))
-            {
-                position = Vector2.Zero;
-                return false;
-            }
+            position = Vector2.Zero;
+            return false;
         }
 
         if (mapPoint == null)
@@ -850,6 +856,23 @@ internal static class OverlayRouteHighlighter
 
         position = mapPoint.GlobalPosition + mapPoint.Size * 0.5f;
         return true;
+    }
+
+    private static void DrawStrokeIfPossible(NMapDrawings drawings, IReadOnlyList<Vector2> stroke, ref int drawnSegments)
+    {
+        if (stroke.Count < 2)
+        {
+            return;
+        }
+
+        drawings.BeginLineLocal(stroke[0], DrawingMode.Drawing);
+        for (int i = 1; i < stroke.Count; i++)
+        {
+            drawings.UpdateCurrentLinePositionLocal(stroke[i]);
+            drawnSegments++;
+        }
+
+        drawings.StopLineLocal();
     }
 }
 
@@ -932,6 +955,7 @@ internal sealed class ProbeOverlayNode : PanelContainer
     private ResizeCorner _activeResizeCorner = ResizeCorner.BottomRight;
     private PanelType _activePanel = PanelType.Combat;
     private DateTime _lastProcessLogUtc = DateTime.MinValue;
+    private DateTime _lastRouteRefreshUtc = DateTime.MinValue;
     private bool _initialized;
     internal Action<string>? DebugLogger { get; set; }
 
@@ -996,6 +1020,15 @@ internal sealed class ProbeOverlayNode : PanelContainer
         }
 
         DateTime utcNow = DateTime.UtcNow;
+        if (_activePanel == PanelType.Route
+            && Visible
+            && !_collapsed
+            && utcNow - _lastRouteRefreshUtc >= TimeSpan.FromSeconds(1))
+        {
+            _lastRouteRefreshUtc = utcNow;
+            ProbeOverlayManager.RefreshRouteHighlight();
+        }
+
         if (utcNow - _lastProcessLogUtc < TimeSpan.FromSeconds(4))
         {
             return;
@@ -1293,7 +1326,7 @@ internal sealed class ProbeOverlayNode : PanelContainer
         {
             SizeFlagsHorizontal = SizeFlags.ExpandFill,
             SizeFlagsVertical = SizeFlags.ExpandFill,
-            CustomMinimumSize = new Vector2(0, 260),
+            CustomMinimumSize = new Vector2(0, 180),
             HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled
         };
         _modifierContainer.AddChild(_modifierScroll);
@@ -1722,10 +1755,12 @@ internal sealed class ProbeOverlayNode : PanelContainer
         _modifierRelicList = new ItemList
         {
             SelectMode = ItemList.SelectModeEnum.Single,
-            AutoHeight = true,
+            AutoHeight = false,
             FixedColumnWidth = 0,
-            CustomMinimumSize = new Vector2(0, 120)
+            CustomMinimumSize = new Vector2(0, 80),
+            SizeFlagsVertical = SizeFlags.ExpandFill
         };
+        ApplyItemListTheme(_modifierRelicList);
         root.AddChild(_modifierRelicList);
 
         Button addRelicButton = new()
@@ -1765,10 +1800,12 @@ internal sealed class ProbeOverlayNode : PanelContainer
         _modifierCardList = new ItemList
         {
             SelectMode = ItemList.SelectModeEnum.Single,
-            AutoHeight = true,
+            AutoHeight = false,
             FixedColumnWidth = 0,
-            CustomMinimumSize = new Vector2(0, 120)
+            CustomMinimumSize = new Vector2(0, 80),
+            SizeFlagsVertical = SizeFlags.ExpandFill
         };
+        ApplyItemListTheme(_modifierCardList);
         root.AddChild(_modifierCardList);
 
         Button addCardButton = new()
@@ -1797,10 +1834,12 @@ internal sealed class ProbeOverlayNode : PanelContainer
         _modifierDeckList = new ItemList
         {
             SelectMode = ItemList.SelectModeEnum.Single,
-            AutoHeight = true,
+            AutoHeight = false,
             FixedColumnWidth = 0,
-            CustomMinimumSize = new Vector2(0, 140)
+            CustomMinimumSize = new Vector2(0, 80),
+            SizeFlagsVertical = SizeFlags.ExpandFill
         };
+        ApplyItemListTheme(_modifierDeckList);
         root.AddChild(_modifierDeckList);
 
         Button upgradeButton = new()
@@ -1858,6 +1897,63 @@ internal sealed class ProbeOverlayNode : PanelContainer
             ContentMarginRight = 6,
             ContentMarginTop = 6
         };
+    }
+
+    private static void ApplyItemListTheme(ItemList list)
+    {
+        StyleBoxFlat selectedStyle = new()
+        {
+            BgColor = new Color(0.28f, 0.48f, 0.65f, 0.85f),
+            CornerRadiusBottomLeft = 3,
+            CornerRadiusBottomRight = 3,
+            CornerRadiusTopLeft = 3,
+            CornerRadiusTopRight = 3,
+            ContentMarginBottom = 2,
+            ContentMarginLeft = 4,
+            ContentMarginRight = 4,
+            ContentMarginTop = 2
+        };
+
+        StyleBoxFlat selectedFocusStyle = new()
+        {
+            BgColor = new Color(0.32f, 0.55f, 0.72f, 0.9f),
+            BorderColor = new Color(0.5f, 0.78f, 0.95f, 0.8f),
+            BorderWidthBottom = 1,
+            BorderWidthLeft = 1,
+            BorderWidthRight = 1,
+            BorderWidthTop = 1,
+            CornerRadiusBottomLeft = 3,
+            CornerRadiusBottomRight = 3,
+            CornerRadiusTopLeft = 3,
+            CornerRadiusTopRight = 3,
+            ContentMarginBottom = 2,
+            ContentMarginLeft = 4,
+            ContentMarginRight = 4,
+            ContentMarginTop = 2
+        };
+
+        StyleBoxFlat focusStyle = new()
+        {
+            BgColor = new Color(0, 0, 0, 0),
+            BorderColor = new Color(0, 0, 0, 0)
+        };
+
+        StyleBoxFlat panelStyle = new()
+        {
+            BgColor = new Color(0.08f, 0.11f, 0.16f, 0.72f),
+            CornerRadiusBottomLeft = 4,
+            CornerRadiusBottomRight = 4,
+            CornerRadiusTopLeft = 4,
+            CornerRadiusTopRight = 4
+        };
+
+        list.AddThemeStyleboxOverride("selected", selectedStyle);
+        list.AddThemeStyleboxOverride("selected_focus", selectedFocusStyle);
+        list.AddThemeStyleboxOverride("focus", focusStyle);
+        list.AddThemeStyleboxOverride("panel", panelStyle);
+        list.AddThemeColorOverride("font_color", new Color(0.88f, 0.94f, 1f));
+        list.AddThemeColorOverride("font_selected_color", new Color(0.98f, 0.96f, 0.88f));
+        list.FocusMode = FocusModeEnum.None;
     }
 
     private void RefreshModifierRows()
@@ -2413,22 +2509,23 @@ internal sealed class ProbeOverlayNode : PanelContainer
             return;
         }
 
-        float bodyHeight = Mathf.Max(180f, Size.Y - 118f);
+        float bodyHeight = Mathf.Max(140f, Size.Y - 118f);
         _modifierScroll.CustomMinimumSize = new Vector2(0, bodyHeight);
+        float listHeight = Mathf.Clamp(bodyHeight * 0.2f, 60f, 140f);
 
         if (_modifierRelicList != null && GodotObject.IsInstanceValid(_modifierRelicList))
         {
-            _modifierRelicList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.28f, 96f, 180f));
+            _modifierRelicList.CustomMinimumSize = new Vector2(0, listHeight);
         }
 
         if (_modifierCardList != null && GodotObject.IsInstanceValid(_modifierCardList))
         {
-            _modifierCardList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.28f, 96f, 180f));
+            _modifierCardList.CustomMinimumSize = new Vector2(0, listHeight);
         }
 
         if (_modifierDeckList != null && GodotObject.IsInstanceValid(_modifierDeckList))
         {
-            _modifierDeckList.CustomMinimumSize = new Vector2(0, Mathf.Clamp(bodyHeight * 0.30f, 110f, 200f));
+            _modifierDeckList.CustomMinimumSize = new Vector2(0, listHeight);
         }
     }
 
