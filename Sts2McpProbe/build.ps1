@@ -24,28 +24,12 @@ if (!(Test-Path $sourceDll)) {
 }
 
 $modDir = Join-Path $repoRoot "mods\Sts2Mcp"
-$pckRootDir = Join-Path $modDir "PckRoot"
 New-Item -ItemType Directory -Path $modDir -Force | Out-Null
-New-Item -ItemType Directory -Path $pckRootDir -Force | Out-Null
 
 Copy-Item $sourceDll (Join-Path $modDir "Sts2Mcp.dll") -Force
-Copy-Item (Join-Path $projectDir "PckRoot\mod_manifest.json") (Join-Path $pckRootDir "mod_manifest.json") -Force
-
-$gameExe = Join-Path $repoRoot "SlayTheSpire2.exe"
-$packerScript = Join-Path $projectDir "tools\pack_pck.gd"
-$outPck = Join-Path $modDir "Sts2Mcp.pck"
-
-Write-Host "Packing PCK..."
-& $gameExe --headless --script $packerScript -- $pckRootDir $outPck
-if ($LASTEXITCODE -ne 0) {
-    throw "PCK packing failed."
-}
-if (!(Test-Path $outPck)) {
-    throw "PCK not found after packing: $outPck"
-}
+Copy-Item (Join-Path $projectDir "PckRoot\mod_manifest.json") (Join-Path $modDir "mod_manifest.json") -Force
 
 Write-Host ""
 Write-Host "Done."
 Write-Host "DLL: $modDir\Sts2Mcp.dll"
-Write-Host "PCK: $modDir\Sts2Mcp.pck"
-Write-Host "PCK root source: $pckRootDir\mod_manifest.json"
+Write-Host "Manifest: $modDir\mod_manifest.json"

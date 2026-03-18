@@ -2066,6 +2066,7 @@ internal sealed class ProbeOverlayNode : PanelContainer
         if (legendEntries != null && legendEntries.Count > 0)
         {
             return legendEntries
+                .Where(static entry => ShouldDisplayRouteLegendType(entry.TypeKey) && entry.Count > 0)
                 .Select(static entry => new OverlayRouteLegendEntry
                 {
                     TypeKey = entry.TypeKey,
@@ -2106,18 +2107,21 @@ internal sealed class ProbeOverlayNode : PanelContainer
         {
             "monster",
             "elite",
-            "question",
             "shop",
             "rest",
             "treasure",
-            "ancient",
-            "boss"
+            "unknown"
         };
 
         List<OverlayRouteLegendEntry> rows = new();
         foreach (string typeKey in preferredOrder)
         {
             counts.TryGetValue(typeKey, out int count);
+            if (count <= 0 || !ShouldDisplayRouteLegendType(typeKey))
+            {
+                continue;
+            }
+
             rows.Add(new OverlayRouteLegendEntry
             {
                 TypeKey = typeKey,
@@ -2128,12 +2132,17 @@ internal sealed class ProbeOverlayNode : PanelContainer
 
         foreach (string key in counts.Keys.OrderBy(static x => x, StringComparer.Ordinal))
         {
-            if (preferredOrder.Contains(key, StringComparer.OrdinalIgnoreCase))
+            if (preferredOrder.Contains(key, StringComparer.OrdinalIgnoreCase) || !ShouldDisplayRouteLegendType(key))
             {
                 continue;
             }
 
             int count = counts[key];
+            if (count <= 0)
+            {
+                continue;
+            }
+
             rows.Add(new OverlayRouteLegendEntry
             {
                 TypeKey = key,
@@ -2143,6 +2152,18 @@ internal sealed class ProbeOverlayNode : PanelContainer
         }
 
         return rows;
+    }
+
+    private static bool ShouldDisplayRouteLegendType(string? routeTypeKey)
+    {
+        if (string.IsNullOrWhiteSpace(routeTypeKey))
+        {
+            return false;
+        }
+
+        return !routeTypeKey.Equals("question", StringComparison.OrdinalIgnoreCase)
+            && !routeTypeKey.Equals("boss", StringComparison.OrdinalIgnoreCase)
+            && !routeTypeKey.Equals("ancient", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string LabelToRouteTypeKey(string? label)

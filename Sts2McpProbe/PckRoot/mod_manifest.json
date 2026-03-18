@@ -1,8 +1,11 @@
 {
   "id": "Sts2Mcp",
-  "pck_name": "Sts2Mcp",
   "name": "STS2 MCP Probe",
   "author": "local",
   "description": "Minimal MCP probe: exports combat state and accepts play_card command.",
-  "version": "0.0.1"
+  "version": "0.0.1",
+  "has_dll": true,
+  "has_pck": false,
+  "dependencies": [],
+  "affects_gameplay": false
 }

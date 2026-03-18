@@ -17,13 +17,15 @@ if (-not $resolvedGamePath) {
 }
 
 $dllSource = Join-Path $PackageDir "Sts2Mcp.dll"
-$pckSource = Join-Path $PackageDir "Sts2Mcp.pck"
-$manifestSource = Join-Path $PackageDir "PckRoot\\mod_manifest.json"
+$manifestSource = Join-Path $PackageDir "mod_manifest.json"
 if (-not (Test-Path $dllSource -PathType Leaf)) {
     throw "Missing installer file: $dllSource"
 }
-if (-not (Test-Path $pckSource -PathType Leaf)) {
-    throw "Missing installer file: $pckSource"
+if (-not (Test-Path $manifestSource -PathType Leaf)) {
+    $legacyManifestSource = Join-Path $PackageDir "PckRoot\\mod_manifest.json"
+    if (Test-Path $legacyManifestSource -PathType Leaf) {
+        $manifestSource = $legacyManifestSource
+    }
 }
 if (-not (Test-Path $manifestSource -PathType Leaf)) {
     throw "Missing installer file: $manifestSource"
@@ -32,7 +34,6 @@ if (-not (Test-Path $manifestSource -PathType Leaf)) {
 $modsDir = Join-Path $resolvedGamePath "mods"
 $targetDir = Join-Path $modsDir "Sts2Mcp"
 $backupDir = Join-Path $modsDir "Sts2Mcp_backup"
-$targetPckRootDir = Join-Path $targetDir "PckRoot"
 New-Item -ItemType Directory -Path $modsDir -Force | Out-Null
 
 if (Test-Path $targetDir -PathType Container) {
@@ -46,10 +47,8 @@ if (Test-Path $targetDir -PathType Container) {
 
 try {
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
-    New-Item -ItemType Directory -Path $targetPckRootDir -Force | Out-Null
     Copy-Item $dllSource (Join-Path $targetDir "Sts2Mcp.dll") -Force
-    Copy-Item $pckSource (Join-Path $targetDir "Sts2Mcp.pck") -Force
-    Copy-Item $manifestSource (Join-Path $targetPckRootDir "mod_manifest.json") -Force
+    Copy-Item $manifestSource (Join-Path $targetDir "mod_manifest.json") -Force
 }
 catch {
     Write-Host "[Sts2Mcp] Install failed, restoring backup..."

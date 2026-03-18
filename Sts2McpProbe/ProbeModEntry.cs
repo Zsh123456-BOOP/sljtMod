@@ -634,7 +634,7 @@ public static class ProbeModEntry
     {
         try
         {
-            Player? localPlayerEntity = LocalContext.GetMe(state);
+            Player? localPlayerEntity = ResolveLocalPlayer(state);
             PlayerSnapshot? localPlayer = localPlayerEntity == null ? null : BuildPlayerSnapshot(localPlayerEntity);
             List<EnemySnapshot> enemies = state.Enemies.Select(enemy => BuildEnemySnapshot(enemy, state)).ToList();
             List<PlayerSnapshot> allPlayers = state.Players.Select(BuildPlayerSnapshot).ToList();
@@ -1481,10 +1481,20 @@ public static class ProbeModEntry
             for (int i = _lastProcessedHistoryEntryCount; i < historyEntries.Count; i++)
             {
                 CombatHistoryEntry entry = historyEntries[i];
-                ProcessHistoryEntryForStats(entry, localCombatId.Value, _totalStats);
-                ProcessHistoryEntryForStats(entry, localCombatId.Value, modeTotals);
-                ProcessHistoryEntryForStats(entry, localCombatId.Value, _activeBattle.Stats);
-                ProcessHistoryEntryForContribution(entry, state, modeKey, playersByCombatId);
+                try
+                {
+                    ProcessHistoryEntryForStats(entry, localCombatId.Value, _totalStats);
+                    ProcessHistoryEntryForStats(entry, localCombatId.Value, modeTotals);
+                    ProcessHistoryEntryForStats(entry, localCombatId.Value, _activeBattle.Stats);
+                    ProcessHistoryEntryForContribution(entry, state, modeKey, playersByCombatId);
+                }
+                catch (Exception ex)
+                {
+                    SafeLog(
+                        "Analytics entry skipped: type=" + entry.GetType().Name
+                        + " round=" + entry.RoundNumber.ToString(CultureInfo.InvariantCulture)
+                        + " error=" + ex.Message);
+                }
             }
 
             _lastProcessedHistoryEntryCount = historyEntries.Count;
@@ -1793,8 +1803,13 @@ public static class ProbeModEntry
         {
             if (playersByCombatId.TryGetValue(combatId, out Player? player))
             {
+                bool hadNetId = existing.NetId != 0;
                 existing.NetId = player.NetId;
                 existing.Name = ResolvePlayerDisplayName(player, combatId);
+                if (!hadNetId && existing.NetId != 0 && !existing.HasTotalsMirror)
+                {
+                    BackfillContributionToAggregateBuckets(existing, _activeBattle?.ModeKey);
+                }
             }
 
             return existing;
@@ -1806,7 +1821,8 @@ public static class ProbeModEntry
             created = new ContributionAccumulator
             {
                 NetId = sourcePlayer.NetId,
-                Name = ResolvePlayerDisplayName(sourcePlayer, combatId)
+                Name = ResolvePlayerDisplayName(sourcePlayer, combatId),
+                HasTotalsMirror = true
             };
         }
         else
@@ -1819,6 +1835,36 @@ public static class ProbeModEntry
 
         _combatContributions[combatId] = created;
         return created;
+    }
+
+    private static void BackfillContributionToAggregateBuckets(ContributionAccumulator combat, string? modeKey)
+    {
+        if (combat.NetId == 0 || combat.HasTotalsMirror)
+        {
+            return;
+        }
+
+        ContributionAccumulator total = EnsureTotalContribution(_totalContributions, combat.NetId, combat.Name);
+        total.Ndps += combat.Ndps;
+        total.SupportDamage += combat.SupportDamage;
+        total.Mitigation += combat.Mitigation;
+        total.TeamBlock += combat.TeamBlock;
+        total.StatusApplications += combat.StatusApplications;
+        total.OffensiveDebuffsApplied += combat.OffensiveDebuffsApplied;
+        total.DefensiveBuffsApplied += combat.DefensiveBuffsApplied;
+
+        string aggregateModeKey = string.IsNullOrWhiteSpace(modeKey) ? "singleplayer" : modeKey;
+        Dictionary<ulong, ContributionAccumulator> modeBucket = EnsureModeContributionBucket(aggregateModeKey);
+        ContributionAccumulator mode = EnsureTotalContribution(modeBucket, combat.NetId, combat.Name);
+        mode.Ndps += combat.Ndps;
+        mode.SupportDamage += combat.SupportDamage;
+        mode.Mitigation += combat.Mitigation;
+        mode.TeamBlock += combat.TeamBlock;
+        mode.StatusApplications += combat.StatusApplications;
+        mode.OffensiveDebuffsApplied += combat.OffensiveDebuffsApplied;
+        mode.DefensiveBuffsApplied += combat.DefensiveBuffsApplied;
+
+        combat.HasTotalsMirror = true;
     }
 
     private static ContributionAccumulator EnsureTotalContribution(
@@ -1930,8 +1976,16 @@ public static class ProbeModEntry
         PowerReceivedEntry powerReceived,
         IReadOnlyDictionary<uint, Player> playersByCombatId)
     {
-        uint? receiverId = powerReceived.Actor.CombatId;
-        if (!receiverId.HasValue)
+        Creature? receiver = powerReceived.Actor;
+        PowerModel? power = powerReceived.Power;
+        if (receiver == null || power == null)
+        {
+            return;
+        }
+
+        uint? receiverId = receiver.CombatId;
+        string powerId = power.Id.Entry;
+        if (!receiverId.HasValue || string.IsNullOrWhiteSpace(powerId))
         {
             return;
         }
@@ -1939,7 +1993,7 @@ public static class ProbeModEntry
         PowerSourceKey key = new()
         {
             ReceiverCombatId = receiverId.Value,
-            PowerId = powerReceived.Power.Id.Entry
+            PowerId = powerId
         };
 
         uint? applierCombatId = ResolveContributorCombatId(powerReceived.Applier, playersByCombatId);
@@ -2005,7 +2059,7 @@ public static class ProbeModEntry
         }
 
         uint? receiverCombatId = ResolveContributorCombatId(blockGained.Receiver, playersByCombatId);
-        uint? sourceCombatId = blockGained.CardPlay?.Card?.Owner?.Creature?.CombatId;
+        uint? sourceCombatId = ResolveBlockSourceCombatId(blockGained, playersByCombatId);
         if (!sourceCombatId.HasValue || !receiverCombatId.HasValue)
         {
             return;
@@ -2026,6 +2080,45 @@ public static class ProbeModEntry
             modeKey,
             playersByCombatId,
             teamBlock: blockGained.Amount);
+    }
+
+    private static uint? ResolveBlockSourceCombatId(
+        BlockGainedEntry blockGained,
+        IReadOnlyDictionary<uint, Player> playersByCombatId)
+    {
+        uint? cardSourceCombatId = ResolveContributorCombatId(blockGained.CardPlay?.Card?.Owner?.Creature, playersByCombatId);
+        if (cardSourceCombatId.HasValue)
+        {
+            return cardSourceCombatId;
+        }
+
+        Creature? receiver = blockGained.Receiver;
+        uint? receiverCombatId = ResolveContributorCombatId(receiver, playersByCombatId);
+        uint? receiverRawCombatId = receiver?.CombatId;
+        if (receiver == null || !receiverCombatId.HasValue || !receiverRawCombatId.HasValue)
+        {
+            return null;
+        }
+
+        List<uint> teammateAppliers = receiver.Powers
+            .Select(power =>
+            {
+                _powerSourceTracker.TryGetValue(new PowerSourceKey
+                {
+                    ReceiverCombatId = receiverRawCombatId.Value,
+                    PowerId = power.Id.Entry
+                }, out PowerSourceRecord? source);
+                return source?.ApplierCombatId;
+            })
+            .Where(static applierCombatId => applierCombatId.HasValue)
+            .Select(static applierCombatId => applierCombatId!.Value)
+            .Where(applierCombatId =>
+                applierCombatId != receiverCombatId.Value
+                && playersByCombatId.ContainsKey(applierCombatId))
+            .Distinct()
+            .ToList();
+
+        return teammateAppliers.Count == 1 ? teammateAppliers[0] : null;
     }
 
     private static void TrackDynamicDamageContribution(
@@ -3319,26 +3412,26 @@ public static class ProbeModEntry
         {
             "monster",
             "elite",
-            "question",
             "shop",
             "rest",
             "treasure",
-            "ancient",
-            "boss"
+            "unknown"
         };
 
         List<RouteReachableTypeSnapshot> rows = preferredOrder
+            .Where(static typeKey => ShouldDisplayRouteReachableType(typeKey))
             .Select(typeKey => new RouteReachableTypeSnapshot
             {
                 TypeKey = typeKey,
                 Label = RouteTypeKeyToLabel(typeKey),
                 Count = counts.TryGetValue(typeKey, out int count) ? count : 0
             })
+            .Where(static row => row.Count > 0)
             .ToList();
 
         foreach ((string key, int count) in counts.OrderBy(static x => x.Key, StringComparer.Ordinal))
         {
-            if (preferredOrder.Contains(key, StringComparer.OrdinalIgnoreCase))
+            if (preferredOrder.Contains(key, StringComparer.OrdinalIgnoreCase) || !ShouldDisplayRouteReachableType(key) || count <= 0)
             {
                 continue;
             }
@@ -3352,6 +3445,18 @@ public static class ProbeModEntry
         }
 
         return rows;
+    }
+
+    private static bool ShouldDisplayRouteReachableType(string? typeKey)
+    {
+        if (string.IsNullOrWhiteSpace(typeKey))
+        {
+            return false;
+        }
+
+        return !typeKey.Equals("question", StringComparison.OrdinalIgnoreCase)
+            && !typeKey.Equals("boss", StringComparison.OrdinalIgnoreCase)
+            && !typeKey.Equals("ancient", StringComparison.OrdinalIgnoreCase);
     }
 
     private static MapCoord? ResolveRouteStartCoord(IRunState runState)
@@ -3989,7 +4094,7 @@ public static class ProbeModEntry
                 CombatTrackerStateField != null &&
                 CombatTrackerStateField.GetValue(tracker) is CombatState trackedState)
             {
-                Player? combatPlayer = LocalContext.GetMe(trackedState);
+                Player? combatPlayer = ResolveLocalPlayer(trackedState);
                 if (combatPlayer != null)
                 {
                     return combatPlayer;
@@ -4003,6 +4108,44 @@ public static class ProbeModEntry
 
         RunState? runState = ResolveCurrentRunState();
         return runState == null ? null : ResolveLocalPlayer(runState);
+    }
+
+    private static Player? ResolveLocalPlayer(CombatState state)
+    {
+        try
+        {
+            Player? localPlayer = LocalContext.GetMe(state);
+            if (localPlayer != null)
+            {
+                return localPlayer;
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        try
+        {
+            if (state.RunState != null)
+            {
+                Player? runLocalPlayer = ResolveLocalPlayer(state.RunState);
+                if (runLocalPlayer != null)
+                {
+                    Player? matchedCombatPlayer = state.Players.FirstOrDefault(player => player.NetId == runLocalPlayer.NetId);
+                    if (matchedCombatPlayer != null)
+                    {
+                        return matchedCombatPlayer;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Fallback below.
+        }
+
+        return state.Players.FirstOrDefault();
     }
 
     private static Player? ResolveLocalPlayer(IRunState runState)
@@ -4726,6 +4869,7 @@ public static class ProbeModEntry
         public int StatusApplications { get; set; }
         public int OffensiveDebuffsApplied { get; set; }
         public int DefensiveBuffsApplied { get; set; }
+        public bool HasTotalsMirror { get; set; }
     }
 
     private sealed class ResolvedPowerModifier

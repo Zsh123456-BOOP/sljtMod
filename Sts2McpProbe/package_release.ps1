@@ -30,25 +30,14 @@ if (!(Test-Path $dllSource -PathType Leaf)) {
     throw "Built dll not found: $dllSource"
 }
 
-$pckSource = Join-Path $repoRoot "mods\Sts2Mcp\Sts2Mcp.pck"
-if (!(Test-Path $pckSource -PathType Leaf)) {
-    Write-Host "[Sts2Mcp] Existing pck not found, trying build.ps1 to generate..."
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectDir "build.ps1") -Configuration $Configuration
-}
-if (!(Test-Path $pckSource -PathType Leaf)) {
-    throw "PCK not found: $pckSource. Please build once in game environment first."
-}
-
 $stageDir = Join-Path $OutputDir "Sts2McpInstaller"
 if (Test-Path $stageDir) {
     Remove-Item $stageDir -Recurse -Force
 }
 New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $stageDir "PckRoot") -Force | Out-Null
 
 Copy-Item $dllSource (Join-Path $stageDir "Sts2Mcp.dll") -Force
-Copy-Item $pckSource (Join-Path $stageDir "Sts2Mcp.pck") -Force
-Copy-Item (Join-Path $projectDir "PckRoot\\mod_manifest.json") (Join-Path $stageDir "PckRoot\\mod_manifest.json") -Force
+Copy-Item (Join-Path $projectDir "PckRoot\\mod_manifest.json") (Join-Path $stageDir "mod_manifest.json") -Force
 Copy-Item (Join-Path $projectDir "tools\InstallerCommon.ps1") (Join-Path $stageDir "InstallerCommon.ps1") -Force
 Copy-Item (Join-Path $projectDir "tools\Install-Sts2Mcp.ps1") (Join-Path $stageDir "Install-Sts2Mcp.ps1") -Force
 Copy-Item (Join-Path $projectDir "tools\Uninstall-Sts2Mcp.ps1") (Join-Path $stageDir "Uninstall-Sts2Mcp.ps1") -Force
